@@ -131,7 +131,7 @@ except ImportError:
 # The user downloads it as a JSON backup file and uploads it again to resume.
 APP_ID = "Americana ERP - PM Module"
 BACKUP_VERSION = 1
-COLLECTIONS = ["users", "assets", "pm_plans", "work_orders", "spare_parts", "breakdowns", "notifications", "chat_sessions", "settings"]
+COLLECTIONS = ["users", "assets", "pm_plans", "work_orders", "spare_parts", "breakdowns", "notifications", "chat_sessions", "settings", "documents"]
 
 # Columns guaranteed to exist (prevents KeyErrors on empty / partial data)
 DEFAULT_COLUMNS = {
@@ -179,6 +179,7 @@ def import_backup(raw_bytes):
     st.session_state.store = store
     st.session_state.wo_counter = int(payload.get("wo_counter", 1))
     st.session_state.dirty = 0
+    st.session_state.pub_mark = None   # force re-publish of technician QR data after a restore
 
 def restore_widget(key):
     """Upload widget. Restores data once per distinct file, then reruns."""
@@ -950,19 +951,24 @@ def _compress_photo(file):
     except Exception:
         return ""
 
-def operator_report_page(tag, name):
+def scan_page(tag, name):
     st.markdown("""<style>
     [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] {display:none}
-    .block-container {max-width: 600px; padding-top: 1.5rem}
+    .block-container {max-width: 760px; padding-top: 1.5rem}
     .stApp {background: linear-gradient(to right, #ffecd2 0%, #fcb69f 100%); font-family: "72","Arial","Helvetica",sans-serif}
     .asset-card {background:#fff; border-left:6px solid #0a6ed1; border-radius:6px; padding:12px 16px; margin:8px 0 14px 0; box-shadow:0 1px 3px rgba(0,0,0,.2)}
     .asset-card b {font-size:1.15rem}
     .stButton>button, .stFormSubmitButton>button {background-color:#d63031; color:#fff; border:none; font-weight:bold; border-radius:4px; width:100%; padding:.6rem}
     </style>""", unsafe_allow_html=True)
     st.image(base64.b64decode(_AMERICANA_LOGO_B64), width=200)
-    st.markdown("## 🚨 Report a Breakdown")
+    st.markdown("## 🏭 Machine access")
     st.markdown(f"<div class='asset-card'><b>{name}</b><br>Tag: <code>{tag}</code></div>", unsafe_allow_html=True)
 
+    tab_rep, tab_info = st.tabs(["🚨 Report Breakdown", "🔧 Technician Info"])
+    with tab_rep: _operator_form(tag, name)
+    with tab_info: _tech_view(tag, name)
+
+def _operator_form(tag, name):
     done = st.session_state.get("op_done")
     if done:
         st.success(f"✅ Report sent to the maintenance team.\n\n**Reference: {done['ref']}**")
@@ -993,9 +999,152 @@ def operator_report_page(tag, name):
             st.session_state.op_done = {"ref": rec["ref"], "name": name, "time": now.strftime("%Y-%m-%d %H:%M")}
             st.rerun()
 
+# ---- Technician / engineer access: published snapshot (read-only, PIN protected) ----
+import hashlib as _hl
+SNAP_DIR = os.path.join(tempfile.gettempdir(), "americana_snapshot")
+SNAP_FILE = os.path.join(SNAP_DIR, "snapshot.json")
+DOCS_DIR = os.path.join(SNAP_DIR, "docs")
+DOC_TYPES = ["Manual", "Diagram / Drawing", "Datasheet", "Procedure / SOP", "Photo", "Certificate / Report", "Other"]
+DOC_ICONS = {"Manual": "📘", "Diagram / Drawing": "📐", "Datasheet": "📄", "Procedure / SOP": "📋", "Photo": "🖼️", "Certificate / Report": "🏅", "Other": "📎"}
+
+def pin_hash(pin):
+    return _hl.sha256(("americana|" + str(pin)).encode()).hexdigest()
+
+def publish_snapshot():
+    """Copies the data technicians may view (assets, work orders, PM plans, parts, documents) to the server
+    so phones scanning a QR can read it. Documents are written to disk once."""
+    s = st.session_state.store
+    os.makedirs(DOCS_DIR, exist_ok=True)
+    docs = s.get("documents", [])
+    wos = []
+    for w in s.get("work_orders", []):
+        d = dict(w)
+        if d.get("status") != "Open": d.pop("photo_b64", None)
+        wos.append(d)
+    snap = {"published_at": str(datetime.now()), "pin_hash": get_setting("tech_pin_hash", ""),
+            "assets": s.get("assets", []), "work_orders": wos, "pm_plans": s.get("pm_plans", []),
+            "spare_parts": [{k: p.get(k) for k in ("name", "sku", "quantity", "location", "cost")} for p in s.get("spare_parts", [])],
+            "documents": [{k: v for k, v in d.items() if k != "data_b64"} for d in docs]}
+    with _inbox_lock():
+        keep = set()
+        for d in docs:
+            fn = d["id"] + ".bin"; keep.add(fn); p = os.path.join(DOCS_DIR, fn)
+            if not os.path.exists(p):
+                with open(p, "wb") as fh: fh.write(base64.b64decode(d.get("data_b64", "")))
+        for fn in os.listdir(DOCS_DIR):
+            if fn not in keep:
+                try: os.remove(os.path.join(DOCS_DIR, fn))
+                except Exception: pass
+        tmp = SNAP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh: json.dump(snap, fh, default=_json_default)
+        os.replace(tmp, SNAP_FILE)
+    st.session_state.pub_info = {"time": snap["published_at"][:16], "assets": len(snap["assets"]), "wos": len(wos), "docs": len(docs)}
+
+@st.cache_resource(show_spinner=False)
+def _snap_read(mtime):
+    with open(SNAP_FILE, "r", encoding="utf-8") as fh: return json.load(fh)
+
+def snap_get():
+    try: return _snap_read(os.path.getmtime(SNAP_FILE))
+    except Exception: return None
+
+def _fmt_size(n):
+    n = float(n or 0)
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{n / 1024:.0f} KB"
+
+def _tech_view(tag, name):
+    snap = snap_get()
+    if not snap or not snap.get("pin_hash"):
+        st.info("🔒 Maintenance information is not available yet. Please ask the maintenance manager to enable technician access.")
+        return
+    if not st.session_state.get("tech_ok"):
+        st.markdown("🔒 **Technician / engineer access**")
+        pin = st.text_input("Enter the technician PIN", type="password", key="tech_pin_in")
+        if st.button("Unlock", key="tech_unlock"):
+            if st.session_state.get("tech_fail", 0) >= 5: st.error("Too many wrong attempts. Please try again later.")
+            elif pin_hash(pin) == snap["pin_hash"]:
+                st.session_state.tech_ok = True; st.session_state.tech_fail = 0; st.rerun()
+            else:
+                st.session_state.tech_fail = st.session_state.get("tech_fail", 0) + 1; st.error("Wrong PIN.")
+        return
+
+    tl = str(tag).lower()
+    asset = next((a for a in snap["assets"] if str(a.get("tag", "")).lower() == tl), None)
+    aname = str((asset or {}).get("name") or name).lower().strip()
+    wos = [w for w in snap["work_orders"] if tl in str(w.get("asset_name", "")).lower() or (isinstance(w.get("meta"), dict) and str(w["meta"].get("tag", "")).lower() == tl)]
+    plans = [p for p in snap["pm_plans"] if tl in str(p.get("asset_name", "")).lower()]
+    docs = [d for d in snap["documents"] if (d.get("scope") == "tag" and str(d.get("tag", "")).lower() == tl) or (d.get("scope") == "name" and str(d.get("name", "")).lower().strip() == aname)]
+    open_ = [w for w in wos if w.get("status") == "Open"]
+    bds = [w for w in wos if "breakdown" in str(w.get("type", "")).lower()]
+    now = datetime.now()
+
+    def age(w):
+        c = pd.to_datetime(w.get("created_at"), errors="coerce")
+        return None if pd.isna(c) else (now - c).days
+    rep = []
+    for w in bds:
+        c, e = pd.to_datetime(w.get("created_at"), errors="coerce"), pd.to_datetime(w.get("closed_date"), errors="coerce")
+        if w.get("status") == "Closed" and pd.notna(c) and pd.notna(e): rep.append((e - c).total_seconds() / 3600)
+    st.caption(f"✅ Unlocked · data published {str(snap['published_at'])[:16]}")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Open WOs", len(open_)); m2.metric("Breakdowns", len(bds))
+    m3.metric("MTTR (h)", f"{sum(rep) / len(rep):.1f}" if rep else "-")
+    m4.metric("Total cost", f"${sum(float(w.get('total_cost') or 0) for w in wos):,.0f}")
+    with st.expander("ℹ️ Asset data", expanded=False):
+        if asset:
+            st.dataframe(pd.DataFrame({"Field": [k.title() for k in asset if k not in ("id", "created_at")], "Value": [str(v) for k, v in asset.items() if k not in ("id", "created_at")]}), use_container_width=True, hide_index=True)
+        else: st.write(f"{name} · {tag} (not found in the published asset list)")
+
+    t_open, t_pm, t_hist, t_docs, t_parts = st.tabs([f"🔧 Open WOs ({len(open_)})", f"📅 PM ({len(plans)})", "📜 History", f"📚 Documents ({len(docs)})", "📦 Spare parts"])
+    with t_open:
+        if not open_: st.success("No open work orders for this machine. 🎉")
+        for w in sorted(open_, key=lambda x: str(x.get("created_at", ""))):
+            a = age(w)
+            with st.expander(f"{w.get('custom_id', '')} · {w.get('type', '')} · {w.get('priority', 'Normal')}" + (f" · {a} d old" if a is not None else "")):
+                if isinstance(w.get("description"), str) and w["description"]: st.write(w["description"])
+                info = [str(w[k]) for k in ("reported_by", "machine_status") if isinstance(w.get(k), str) and w.get(k)]
+                if info: st.caption("Reported by " + " · ".join(info))
+                for t in (w.get("tasks_data") or []):
+                    if isinstance(t, dict): st.markdown(("✅ " if t.get("done") else "⬜ ") + str(t.get("desc", "")))
+                if isinstance(w.get("photo_b64"), str) and w["photo_b64"]:
+                    try: st.image(base64.b64decode(w["photo_b64"]), width=300)
+                    except Exception: pass
+                for p in (w.get("parts_used") or []):
+                    if isinstance(p, dict): st.caption(f"🔩 {p.get('name')} × {p.get('qty')}")
+    with t_pm:
+        if not plans: st.info("No PM plans for this machine.")
+        for p in plans:
+            with st.expander(f"{p.get('frequency', '')} PM · next due {p.get('next_due', '-')} · {p.get('status', '')}"):
+                for t in (p.get("tasks_data") or []):
+                    if isinstance(t, dict): st.markdown("▫️ " + str(t.get("desc", "")))
+    with t_hist:
+        cl = sorted([w for w in wos if w.get("status") == "Closed"], key=lambda x: str(x.get("closed_date", "")), reverse=True)[:20]
+        if not cl: st.info("No closed work orders yet.")
+        else:
+            st.dataframe(one_based(pd.DataFrame([{"WO #": w.get("custom_id"), "Type": w.get("type"), "Description": w.get("description"), "Closed": str(w.get("closed_date", ""))[:16],
+                                                  "Technician": w.get("fixing_technician"), "Cost ($)": w.get("total_cost")} for w in cl])), use_container_width=True)
+    with t_docs:
+        if not docs: st.info("No documents uploaded for this machine yet.")
+        for d in sorted(docs, key=lambda x: (x.get("doc_type", ""), x.get("title", ""))):
+            path = os.path.join(DOCS_DIR, str(d["id"]) + ".bin")
+            with st.expander(f"{DOC_ICONS.get(d.get('doc_type'), '📎')} {d.get('title')} · {d.get('doc_type')} · {_fmt_size(d.get('size'))}"):
+                if not os.path.exists(path):
+                    st.warning("File not available on the server. Ask the manager to publish again."); continue
+                is_img = str(d.get("mime", "")).startswith("image/")
+                if is_img and (d.get("size") or 0) < 3_000_000:
+                    with open(path, "rb") as fh: st.image(fh.read())
+                if st.checkbox("Prepare download", key=f"prep_{d['id']}"):
+                    with open(path, "rb") as fh: data = fh.read()
+                    st.download_button(f"⬇️ {d.get('filename')}", data, d.get("filename"), d.get("mime") or "application/octet-stream", key=f"dl_{d['id']}")
+    with t_parts:
+        q = st.text_input("Search spare parts", key="tech_part_q").strip().lower()
+        parts = [p for p in snap.get("spare_parts", []) if not q or q in str(p.get("name", "")).lower() or q in str(p.get("sku", "")).lower()][:40]
+        if parts: st.dataframe(one_based(pd.DataFrame(parts).rename(columns=str.title)), use_container_width=True)
+        else: st.info("No matching parts.")
+
 _scan_tag = st.query_params.get("r")
 if _scan_tag:
-    operator_report_page(_scan_tag, st.query_params.get("n") or _scan_tag)
+    scan_page(_scan_tag, st.query_params.get("n") or _scan_tag)
     st.stop()
 
 # --- 5. AUTHENTICATION ---
@@ -1298,6 +1447,13 @@ with st.sidebar:
 
     menu = st.radio("ERP Modules", menu_options, label_visibility="collapsed")
 
+# --- AUTO-PUBLISH technician QR data (when a PIN is set) ---
+if get_setting("tech_pin_hash", "") and get_setting("auto_publish", True) and st.session_state.get("pub_mark") != st.session_state.dirty:
+    try:
+        publish_snapshot(); st.session_state.pub_mark = st.session_state.dirty
+    except Exception as _e:
+        print(f"Publish error: {_e}")
+
 # --- APPLY SAP STYLE ---
 add_sap_styling(menu)
 
@@ -1376,7 +1532,7 @@ def make_label_png(display_id, name, payload, logo_bytes=b""):
         f_id = _qr_font(f_id.size - 4)
     center(display_id, head + W + 12, f_id, (27, 42, 58))
     center(name[:40], head + W + 72, _qr_font(26, bold=False), (90, 100, 110))
-    center("Scan to report a breakdown", head + W + 112, _qr_font(24), (214, 48, 49))
+    center("Scan: report breakdown / maintenance info", head + W + 112, _qr_font(24), (214, 48, 49))
     d.rectangle((0, 0, canvas.size[0] - 1, canvas.size[1] - 1), outline=(180, 190, 200), width=3)
     buf = io.BytesIO(); canvas.save(buf, "PNG"); return buf.getvalue()
 
@@ -1415,7 +1571,7 @@ def create_qr_labels_pdf(df, logo_bytes=b"", cols=3, rows=4, progress=None):
         pdf.cell(cw - 2, 4, _lat(name[:40]), 0, 2, "C")
         if loc: pdf.cell(cw - 2, 4, _lat(loc[:44]), 0, 2, "C")
         pdf.set_font("Arial", "B", 6.5); pdf.set_text_color(214, 48, 49)
-        pdf.cell(cw - 2, 3.5, "SCAN TO REPORT A BREAKDOWN", 0, 2, "C")
+        pdf.cell(cw - 2, 3.5, "SCAN: REPORT / MAINTENANCE INFO", 0, 2, "C")
         if progress and (i % 5 == 0 or i == n - 1): progress((i + 1) / max(n, 1))
     try:
         os.remove(hl_path); os.rmdir(tmp)
@@ -1512,6 +1668,8 @@ FAQ = [
     ("how to change kpi targets mttr mtbf oee", "In **📊 Dashboard → ⚡ Reliability Center**, open **Configure KPI Targets** and adjust the values."),
     ("how to view notifications alerts messages", "Open **🔔 Alerts → Latest Messages** in the sidebar to see the 10 most recent events."),
     ("how to forecast opex budget", "Open **💼 Maintenance Manager** (managers only), set actuals, inflation and risk allowance to see the OPEX forecast waterfall."),
+    ("how to upload manuals documents diagrams for a machine", "Go to **🛠️ Asset Master Data → 📚 Documents**, pick the machine (or all machines with the same name), choose the type (Manual, Diagram…), select the files and click **Save document(s)**."),
+    ("how do technicians see work orders and manuals by scanning qr code", "Set a PIN in **🛠️ Asset Master Data → 📡 Technician Access** and publish. Technicians scan the machine QR, open the **🔧 Technician Info** tab and enter the PIN to see open work orders, PM plans, history, spare parts and documents."),
     ("how to review my previous chats with migo", "In **🤖 Migo Chatbot**, switch to **📜 Chat History** to search, review, continue, download or delete past conversations."),
 ]
 
@@ -2600,7 +2758,7 @@ elif menu == "🤖 Migo Chatbot":
 # --- MODULE 4: ASSETS & QR CODES ---
 elif menu == "🛠️ Asset Master Data":
     st.title("🛠️ Asset Management")
-    tab1, tab2, tab3 = st.tabs(["📤 Upload Master Data", "📋 Master Data", "🖨️ QR Generator"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload Master Data", "📋 Master Data", "🖨️ QR Generator", "📚 Documents", "📡 Technician Access"])
     df_assets = load_collection('assets')
 
     with tab1:
@@ -2721,6 +2879,83 @@ elif menu == "🛠️ Asset Master Data":
                 q = st.session_state.qr_pdf
                 st.success(f"✅ {q['count']} QR labels ready.")
                 st.download_button("📥 Download All QR Labels (PDF)", q["bytes"], f"Americana_QR_Labels_{q['stamp']}.pdf", "application/pdf", key="qr_bulk_dl")
+
+    with tab4:
+        st.subheader("📚 Technical Documents (manuals, diagrams, procedures)")
+        docs = st.session_state.store.setdefault("documents", [])
+        if df_assets.empty:
+            st.warning("Add assets first.")
+        else:
+            df_assets["qr_display"] = df_assets["name"].astype(str) + " / " + df_assets["tag"].fillna("").astype(str)
+            if "doc_up_n" not in st.session_state: st.session_state.doc_up_n = 0
+            scope = st.radio("Document applies to", ["This asset only", "All assets with the same machine name"], horizontal=True)
+            sel_asset = st.selectbox("Asset", df_assets["qr_display"].unique(), key="doc_asset")
+            c_d1, c_d2 = st.columns(2)
+            d_type = c_d1.selectbox("Document type", DOC_TYPES)
+            d_title = c_d2.text_input("Title (optional - file name is used if empty)")
+            up_files = st.file_uploader("Select files (PDF, images, Word, Excel, CAD…) - max 25 MB each", accept_multiple_files=True,
+                                        type=["pdf", "png", "jpg", "jpeg", "docx", "doc", "xlsx", "xls", "pptx", "dwg", "dxf", "txt", "csv", "zip"], key=f"doc_up_{st.session_state.doc_up_n}")
+            if st.button("💾 Save document(s)", key="doc_save"):
+                if not up_files:
+                    st.warning("Select at least one file.")
+                else:
+                    arow = df_assets[df_assets["qr_display"] == sel_asset].iloc[0]
+                    saved = 0
+                    for f in up_files:
+                        raw = f.getvalue()
+                        if len(raw) > 25 * 1024 * 1024:
+                            st.error(f"{f.name} is larger than 25 MB - skipped."); continue
+                        docs.append({"id": uuid.uuid4().hex, "title": (d_title.strip() or f.name) if len(up_files) == 1 else f.name, "doc_type": d_type,
+                                     "scope": "tag" if scope.startswith("This") else "name", "tag": str(arow.get("tag", "")) if scope.startswith("This") else "",
+                                     "name": str(arow.get("name", "")), "filename": f.name, "mime": f.type or "application/octet-stream", "size": len(raw),
+                                     "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "uploaded_by": st.session_state.get("user", ""),
+                                     "data_b64": base64.b64encode(raw).decode()})
+                        saved += 1
+                    if saved:
+                        st.session_state.dirty += 1; st.session_state.doc_up_n += 1
+                        log_notification(f"📚 {saved} document(s) uploaded for {arow.get('name', '')}", toast=False)
+                        st.success(f"Saved {saved} document(s)."); time.sleep(1); st.rerun()
+        st.divider()
+        total_mb = sum(d.get("size", 0) for d in docs) / 1048576
+        st.markdown(f"**Stored documents: {len(docs)} · {total_mb:.1f} MB**")
+        if total_mb > 50: st.warning("Documents are saved inside your data file - it is getting large. Consider keeping only the essential manuals.")
+        if docs:
+            q = st.text_input("🔎 Search documents", key="doc_q").strip().lower()
+            shown = [d for d in docs if not q or q in (d.get("title", "") + d.get("name", "") + d.get("tag", "") + d.get("doc_type", "")).lower()]
+            st.dataframe(one_based(pd.DataFrame([{"Title": d["title"], "Type": d["doc_type"], "Applies to": (d["tag"] or f"All '{d['name']}'") if d["scope"] == "tag" else f"All '{d['name']}'",
+                                                  "Machine": d["name"], "File": d["filename"], "Size": _fmt_size(d["size"]), "Uploaded": d["uploaded_at"]} for d in shown])), use_container_width=True)
+            if shown:
+                pick = st.selectbox("Select a document", range(len(shown)), format_func=lambda i: f"{shown[i]['title']} ({shown[i]['doc_type']})", key="doc_pick")
+                dd = shown[pick]; raw = base64.b64decode(dd.get("data_b64", ""))
+                if str(dd.get("mime", "")).startswith("image/"): st.image(raw, width=320)
+                b_a, b_b = st.columns(2)
+                b_a.download_button("⬇️ Download", raw, dd["filename"], dd.get("mime") or "application/octet-stream", key="doc_dl_mgr", use_container_width=True)
+                if b_b.button("🗑️ Delete document", key="doc_del", use_container_width=True):
+                    docs.remove(dd); st.session_state.dirty += 1; st.rerun()
+
+    with tab5:
+        st.subheader("📡 Technician / Engineer QR Access")
+        st.markdown("Scanning a machine QR opens a page with two tabs: **🚨 Report Breakdown** (operators, no PIN) and **🔧 Technician Info** "
+                    "(PIN protected, read-only): open work orders, PM plans, history, spare parts availability and the uploaded documents for that machine.")
+        pin_set = bool(get_setting("tech_pin_hash", ""))
+        st.info("🔑 A technician PIN is set." if pin_set else "No PIN set yet - technician access is disabled until you set one.")
+        p1, p2 = st.columns([3, 1])
+        new_pin = p1.text_input("Set / change the technician PIN (min. 4 characters)", type="password", key="tech_pin_new")
+        if p2.button("Save PIN", key="tech_pin_save"):
+            if len(new_pin.strip()) < 4: st.error("The PIN must have at least 4 characters.")
+            else:
+                set_setting("tech_pin_hash", pin_hash(new_pin.strip())); publish_snapshot(); st.session_state.pub_mark = st.session_state.dirty
+                st.success("PIN saved and data published. Share the PIN with technicians and engineers only."); st.rerun()
+        auto = st.checkbox("Auto-publish after every change (recommended)", value=bool(get_setting("auto_publish", True)))
+        if auto != bool(get_setting("auto_publish", True)):
+            set_setting("auto_publish", auto)
+        if st.button("📡 Publish now", key="tech_publish", disabled=not pin_set):
+            publish_snapshot(); st.session_state.pub_mark = st.session_state.dirty; st.success("Published.")
+        info = st.session_state.get("pub_info")
+        if info:
+            i1, i2, i3, i4 = st.columns(4)
+            i1.metric("Last published", info["time"]); i2.metric("Assets", info["assets"]); i3.metric("Work orders", info["wos"]); i4.metric("Documents", info["docs"])
+        st.caption("⚠️ Published data lives on the app server. If the app restarts or sleeps it is cleared - load your data file and it is published again automatically (when a PIN is set).")
 
 # --- MODULE 3: PLANNED MAINTENANCE ---
 elif menu == "📅 Planned Maintenance":
