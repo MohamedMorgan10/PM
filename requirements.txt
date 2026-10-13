@@ -1,1 +1,9 @@
 streamlit
+pandas
+firebase-admin
+plotly
+qrcode
+Pillow
+fpdf
+numpy
+scikit-learn
