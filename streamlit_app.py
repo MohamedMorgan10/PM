@@ -55,8 +55,19 @@ except ImportError:
 try:
     import openpyxl
 except ImportError:
-    install("openpyxl")
-    import openpyxl
+    try:
+        install("openpyxl")
+        import openpyxl
+    except Exception:
+        openpyxl = None   # app still runs; only .xlsx upload is affected (add openpyxl to requirements.txt)
+
+def read_upload(f):
+    """Read an uploaded CSV / XLSX into a DataFrame."""
+    if f.name.lower().endswith(".csv"):
+        return pd.read_csv(f)
+    if openpyxl is None:
+        raise ImportError("Excel support is missing. Add 'openpyxl' to requirements.txt (or upload a CSV file).")
+    return pd.read_excel(f)
 
 # Machine Learning
 try:
@@ -544,9 +555,7 @@ def get_machine_data():
 
     if uploaded_file is not None:
         try:
-            if uploaded_file.name.endswith('.csv'): df = pd.read_csv(uploaded_file)
-            else: df = pd.read_excel(uploaded_file)
-            return df
+            return read_upload(uploaded_file)
         except Exception as e:
             st.sidebar.error(f"Error reading file: {e}")
             return pd.DataFrame()
@@ -1816,8 +1825,7 @@ elif menu == "🛠️ Asset Master Data":
         uploaded_file = st.file_uploader("Choose a file", type=['csv', 'xlsx'], key="asset_import_upload")
         if uploaded_file is not None:
             try:
-                if uploaded_file.name.endswith('.csv'): df_upload = pd.read_csv(uploaded_file)
-                else: df_upload = pd.read_excel(uploaded_file)
+                df_upload = read_upload(uploaded_file)
                 st.write("Preview:"); st.dataframe(one_based(df_upload.head()))
                 if st.button("Import Data"):
                     lookup = {str(c).strip().lower(): c for c in df_upload.columns}
