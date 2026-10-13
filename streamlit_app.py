@@ -131,7 +131,7 @@ except ImportError:
 # The user downloads it as a JSON backup file and uploads it again to resume.
 APP_ID = "Americana ERP - PM Module"
 BACKUP_VERSION = 1
-COLLECTIONS = ["users", "assets", "pm_plans", "work_orders", "spare_parts", "breakdowns", "notifications", "chat_sessions"]
+COLLECTIONS = ["users", "assets", "pm_plans", "work_orders", "spare_parts", "breakdowns", "notifications", "chat_sessions", "settings"]
 
 # Columns guaranteed to exist (prevents KeyErrors on empty / partial data)
 DEFAULT_COLUMNS = {
@@ -394,318 +394,17 @@ def update_document(collection_name, doc_id, data):
     except Exception as e:
         st.error(f"Error updating data: {e}")
 
-# --- 5. AUTHENTICATION ---
-if 'user' not in st.session_state:
-    st.session_state.user = None
-if 'role' not in st.session_state:
-    st.session_state.role = None
-if 'wo_counter' not in st.session_state:
-    st.session_state.wo_counter = 1
-
-def login_screen():
-    st.markdown("""
-    <style>
-    .stApp { background-color: #f0f2f5; }
-    .login-box {
-        background: white; padding: 40px; border-radius: 8px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    col1, col2, col3 = st.columns([1,2,1])
-    with col2:
-        st.markdown("## 🏭 FactoryPro Login")
-        st.markdown("**Enterprise Access**")
-
-        # Resume previous session BEFORE signing in
-        with st.expander("📂 Resume previous work (upload saved data file)", expanded=False):
-            restore_widget("restore_login")
-            n_docs = sum(len(v) for v in st.session_state.store.values())
-            if n_docs: st.caption(f"✅ Data loaded: {n_docs} records")
-
-        with st.form("login"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Sign In")
-
-            if submitted:
-                if username == "admin" and password == "admin123":
-                    st.session_state.user = "admin"
-                    st.session_state.role = "Manager"
-                    st.rerun()
-
-                users = load_collection('users')
-                if not users.empty:
-                    user_match = users[users['username'] == username]
-                    if not user_match.empty:
-                        db_pass = user_match.iloc[0].get('password_hash', '')
-                        if db_pass == hash_password(password) or db_pass == password:
-                            st.session_state.user = username
-                            if username == "admin":
-                                st.session_state.role = "Manager"
-                            else:
-                                st.session_state.role = user_match.iloc[0].get('role', 'User')
-                            st.success("Login Successful")
-                            time.sleep(0.5)
-                            st.rerun()
-                        else:
-                            st.error("Invalid Password")
-                    else:
-                        st.error("User not found")
-                else:
-                    st.info("No users stored. Use Master: admin / admin123")
-
-if not st.session_state.user:
-    login_screen()
-    st.stop()
-
-# --- 6. PDF GENERATOR ---
-class PDF(FPDF):
-    def header(self):
-        self.set_font('Arial', 'B', 15)
-        self.cell(0, 10, 'Americana Foods - EP Plants', 0, 1, 'L')
-        self.set_font('Arial', 'I', 10)
-        self.cell(0, 10, 'Maintenance Work Order', 0, 1, 'L')
-        self.line(10, 30, 200, 30)
-        self.ln(5)
-    def footer(self):
-        self.set_y(-15)
-        self.set_font('Arial', 'I', 8)
-        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
-
-def create_wo_pdf(wo_data):
-    pdf = PDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=10)
-
-    def get_meta_value(key):
-        meta = wo_data.get('meta')
-        if isinstance(meta, dict):
-            return str(meta.get(key, ''))
-        return ''
-
-    def print_field(label, value):
-        pdf.set_font("Arial", 'B', 10)
-        pdf.cell(35, 8, label, 0, 0)
-        pdf.set_font("Arial", '', 10)
-        pdf.cell(55, 8, str(value), 0, 0)
-
-    print_field("Product Brand:", get_meta_value('brand'))
-    print_field("Product Type:", wo_data.get('asset_name', ''))
-    pdf.ln(8)
-    print_field("Manufacturer:", get_meta_value('manufacturer'))
-    label_txt = f"{wo_data.get('asset_name', '')} / {get_meta_value('tag')}"
-    print_field("Label:", label_txt)
-    pdf.ln(8)
-    print_field("Section:", get_meta_value('section'))
-    print_field("Tag Number:", get_meta_value('tag'))
-    pdf.ln(8)
-    print_field("Line:", get_meta_value('line'))
-    print_field("Location:", get_meta_value('location'))
-    pdf.ln(8)
-    print_field("Overhaul ID:", wo_data.get('custom_id', ''))
-    pdf.ln(12)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(5)
-
-    pdf.set_font("Arial", 'B', 10)
-    pdf.cell(40, 8, "Check Type:", 0, 0)
-    pdf.set_font("Arial", '', 10)
-    pdf.cell(50, 8, str(wo_data.get('type', '')), 0, 1)
-
-    pdf.set_font("Arial", 'B', 10)
-    pdf.cell(40, 8, "Description:", 0, 0)
-    pdf.set_font("Arial", '', 10)
-    desc = wo_data.get('description', '')
-    pdf.multi_cell(0, 8, str(desc) if isinstance(desc, str) else '')
-    pdf.ln(5)
-
-    pdf.set_fill_color(255, 230, 230)
-    pdf.set_font("Arial", 'B', 9)
-    pdf.multi_cell(0, 8, "SAFETY WARNING: Never perform maintenance unless machine is at complete standstill. LOTO Applied.", 1, 'C', True)
-    pdf.ln(5)
-
-    pdf.set_fill_color(220, 220, 220)
-    pdf.cell(10, 8, "#", 1, 0, 'C', True)
-    pdf.cell(110, 8, "Task Description", 1, 0, 'C', True)
-    pdf.cell(20, 8, "Status", 1, 0, 'C', True)
-    pdf.cell(50, 8, "Remarks", 1, 1, 'C', True)
-
-    tasks = wo_data.get('tasks_data')
-    pdf.set_font("Arial", '', 9)
-    if isinstance(tasks, list) and len(tasks) > 0:
-        for idx, t in enumerate(tasks, 1):
-            if isinstance(t, dict):
-                pdf.cell(10, 8, str(t.get('id', idx)), 1, 0, 'C')
-                pdf.cell(110, 8, str(t.get('desc', '')), 1, 0, 'L')
-                done_mark = "DONE" if t.get('done') else "PENDING"
-                pdf.cell(20, 8, done_mark, 1, 0, 'C')
-                pdf.cell(50, 8, str(t.get('remark', '')), 1, 1, 'L')
-    else:
-        pdf.cell(190, 8, "See General Remarks", 1, 1, 'C')
-    pdf.ln(10)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(5)
-
-    parts = wo_data.get('parts_used', [])
-    if parts and isinstance(parts, list) and len(parts) > 0:
-        pdf.set_font("Arial", 'B', 10)
-        pdf.cell(0, 8, "Spare Parts & Spendings", 0, 1, 'L')
-        pdf.set_fill_color(240, 240, 240)
-        pdf.set_font("Arial", 'B', 9)
-        pdf.cell(80, 8, "Part Name", 1, 0, 'L', True)
-        pdf.cell(20, 8, "Qty", 1, 0, 'C', True)
-        pdf.cell(30, 8, "Unit Cost", 1, 0, 'R', True)
-        pdf.cell(30, 8, "Total", 1, 1, 'R', True)
-        pdf.set_font("Arial", '', 9)
-        total_parts_cost = 0.0
-        for p in parts:
-            name = str(p.get('name', 'Unknown'))
-            qty = float(p.get('qty', 0))
-            line_total = float(p.get('total_cost', 0))
-            cost = float(p.get('unit_cost', line_total / qty if qty else 0))
-            total_parts_cost += line_total
-            pdf.cell(80, 8, name, 1, 0, 'L')
-            pdf.cell(20, 8, str(qty), 1, 0, 'C')
-            pdf.cell(30, 8, f"${cost:.2f}", 1, 0, 'R')
-            pdf.cell(30, 8, f"${line_total:.2f}", 1, 1, 'R')
-        pdf.set_font("Arial", 'B', 9)
-        pdf.cell(130, 8, "Total Spare Parts Cost:", 1, 0, 'R')
-        pdf.cell(30, 8, f"${total_parts_cost:.2f}", 1, 1, 'C', True)
-        pdf.ln(8)
-    else:
-        pdf.set_font("Arial", 'I', 9)
-        pdf.cell(0, 10, "No spare parts consumed.", 0, 1, 'L')
-
-    tech = wo_data.get('fixing_technician')
-    if not isinstance(tech, str) or not tech:
-        tech = wo_data.get('technician', '')
-    approver = wo_data.get('approver', '')
-    pdf.set_font("Arial", 'B', 10)
-    pdf.cell(90, 10, f"Technician: {tech if isinstance(tech, str) else ''}", 0, 0)
-    pdf.cell(90, 10, f"Approver: {approver if isinstance(approver, str) else ''}", 0, 1)
-
-    return pdf.output(dest='S').encode('latin-1', 'replace')
-
-# --- 7. DATA HANDLING ---
-def generate_overhaul_id(wo_number):
-    now = datetime.now()
-    return f"{wo_number:04d}{now.hour:02d}{now.minute:02d}{now.day:02d}{now.month:02d}{now.year}"
-
-def get_machine_data():
-    st.sidebar.markdown("---")
-    st.sidebar.header("📂 PM Data Source")
-    st.sidebar.caption("Upload file (Machine Name, Site, Section, etc.)")
-    uploaded_file = st.sidebar.file_uploader("Upload Machine List (Optional)", type=['csv', 'xlsx'], key="machine_list_upload")
-
-    if uploaded_file is not None:
-        try:
-            raw, _counts = read_upload_all(uploaded_file)
-            n = normalize_assets_df(raw)
-            return pd.DataFrame({
-                "Machine Name": n["name"], "Brand": "Generic", "Manufacturer": "Generic",
-                "Tag Number": n["tag"], "Frequency": "Standard", "Site": n["site"], "Section": n["section"],
-                "Line": n["line"], "Factory": n["factory"]})
-        except Exception as e:
-            st.sidebar.error(f"Error reading file: {e}")
-            return pd.DataFrame()
-    else:
-        df_assets = load_collection('assets')
-        if not df_assets.empty:
-            return pd.DataFrame({
-                "Machine Name": df_assets.get('name', 'Unknown'),
-                "Brand": df_assets.get('brand', 'Generic'),
-                "Manufacturer": df_assets.get('manufacturer', 'Generic'),
-                "Tag Number": df_assets.get('tag', 'Unknown'),
-                "Frequency": "Standard",
-                "Site": df_assets.get('site', "Unknown"),
-                "Section": df_assets.get('section', "Unknown")
-            })
-        else:
-            return pd.DataFrame(columns=["Machine Name", "Brand", "Manufacturer", "Tag Number", "Site", "Section"])
-
-# --- 8. SIDEBAR (RESTRUCTURED & WHITE TEXT) ---
-with st.sidebar:
-    # 1. Image/Logo at Top
-    st.image("https://cdn-icons-png.flaticon.com/512/906/906343.png", width=60)
-
-    # 2. User Info
-    user_display = st.session_state.get('user', 'User')
-    st.markdown(f"**User: {user_display}**")
-
-    # 3. Connection Status
-    st.markdown("✅ **ERP Connected**")
-
-    st.write("") # Spacer
-
-    # 3b. DATA FILE (replaces the database)
-    st.markdown("### 💾 Data File")
-    if st.session_state.dirty > 0:
-        st.markdown(f"⚠️ **{st.session_state.dirty} unsaved change(s)**")
-    else:
-        st.markdown("✅ All changes saved")
-    st.download_button(
-        "📥 Save Data to File",
-        data=export_backup(),
-        file_name=f"americana_erp_data_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-        mime="application/json",
-        key="download_backup",
-        on_click=lambda: st.session_state.update(dirty=0),
-    )
-    with st.expander("📂 Load Data from File", expanded=False):
-        restore_widget("restore_sidebar")
-
-    st.write("")
-
-    # 4. Alerts
-    st.markdown("### 🔔 Alerts")
-    notes_data = fetch_notifications()
-    with st.expander("Latest Messages", expanded=False):
-        if notes_data:
-            for n_data in notes_data:
-                ts = n_data.get('timestamp')
-                time_str = ts.strftime("%H:%M") if pd.notna(ts) else ""
-                st.markdown(f"**{time_str}** {n_data.get('message', '')}")
-        else:
-            st.markdown("No notifications.")
-
-    st.write("") # Spacer
-
-    # 5. Logout Button
-    if st.button("LOGOUT", type="primary"):
-        st.session_state.user = None
-        st.rerun()
-
-    st.write("") # Spacer
-
-    # 6. Menu Modules (AT BOTTOM)
-    st.markdown("**ERP Modules**")
-    menu_options = ["📊 Dashboard", "🤖 Migo Chatbot", "🛠️ Asset Master Data", "📅 Planned Maintenance", "🔧 Work Orders", "📦 Inventory", "🚨 Breakdown Reporting"]
-
-    if st.session_state.role == "Manager" or st.session_state.user == "admin":
-         menu_options.append("💼 Maintenance Manager")
-
-    menu = st.radio("ERP Modules", menu_options, label_visibility="collapsed")
-
-# --- APPLY SAP STYLE ---
-add_sap_styling(menu)
-
 # =====================================================================
-# --- QR LABEL ENGINE (styled QR + logo + printable A4 label sheets) ---
+# --- 4b. SCAN-TO-REPORT: operator page (NO login) + shared inbox ---
+# QR codes open  <APP_URL>/?r=<TAG>&n=<MACHINE NAME>  -> breakdown form.
+# Reports land in a server-side inbox shared by all sessions; the maintenance
+# manager imports them as Open Breakdown work orders (Breakdown Reporting page).
 # =====================================================================
 import os
+import base64
 import tempfile
-from PIL import ImageDraw, ImageFont
-
-def _qr_font(size, bold=True):
-    names = (["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "arialbd.ttf", "Arial Bold.ttf"] if bold
-             else ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "arial.ttf", "Arial.ttf"])
-    for n in names:
-        try: return ImageFont.truetype(n, size)
-        except Exception: pass
-    try: return ImageFont.load_default(size)
-    except Exception: return ImageFont.load_default()
+import threading
+from urllib.parse import quote
 
 _AMERICANA_LOGO_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAArwAAADcCAYAAACS0XIwAACM00lEQVR42u2dd5wbxfn/PzNbVa/bd+7lDBjTbdOL6RgwYMCQQgvf"
@@ -1192,6 +891,433 @@ _AMERICANA_LOGO_B64 = (
     "fntdXPQ6ISGhfUX/H6dlaUgteXPhAAAAAElFTkSuQmCC"
 )
 
+INBOX_FILE = os.path.join(tempfile.gettempdir(), "americana_breakdown_inbox.json")
+
+@st.cache_resource
+def _inbox_lock():
+    return threading.Lock()
+
+def inbox_load():
+    try:
+        with open(INBOX_FILE, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return []
+
+def _inbox_write(items):
+    tmp = INBOX_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(items, fh)
+    os.replace(tmp, INBOX_FILE)
+
+def inbox_add(rec):
+    with _inbox_lock():
+        items = inbox_load(); items.append(rec); _inbox_write(items)
+
+def inbox_remove(ids):
+    ids = set(ids)
+    with _inbox_lock():
+        _inbox_write([i for i in inbox_load() if i.get("id") not in ids])
+
+def get_setting(key, default=""):
+    for d in st.session_state.store.get("settings", []):
+        if key in d: return d[key]
+    return default
+
+def set_setting(key, value):
+    lst = st.session_state.store.setdefault("settings", [])
+    if lst: lst[0][key] = value
+    else: lst.append({key: value})
+    st.session_state.dirty += 1
+
+APP_URL_DEFAULT = "https://gearbox-cmms.streamlit.app"
+
+def get_app_url():
+    u = get_setting("app_url", "")
+    if not u:
+        try: u = st.secrets.get("APP_URL", "")
+        except Exception: u = ""
+    return (u or APP_URL_DEFAULT).strip().rstrip("/")
+
+def build_scan_url(base, tag, name):
+    return f"{base.rstrip('/')}/?r={quote(str(tag))}&n={quote(str(name))}"
+
+def _compress_photo(file):
+    try:
+        im = Image.open(file).convert("RGB"); im.thumbnail((900, 900))
+        buf = io.BytesIO(); im.save(buf, "JPEG", quality=70, optimize=True)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return ""
+
+def operator_report_page(tag, name):
+    st.markdown("""<style>
+    [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"] {display:none}
+    .block-container {max-width: 600px; padding-top: 1.5rem}
+    .stApp {background: linear-gradient(to right, #ffecd2 0%, #fcb69f 100%); font-family: "72","Arial","Helvetica",sans-serif}
+    .asset-card {background:#fff; border-left:6px solid #0a6ed1; border-radius:6px; padding:12px 16px; margin:8px 0 14px 0; box-shadow:0 1px 3px rgba(0,0,0,.2)}
+    .asset-card b {font-size:1.15rem}
+    .stButton>button, .stFormSubmitButton>button {background-color:#d63031; color:#fff; border:none; font-weight:bold; border-radius:4px; width:100%; padding:.6rem}
+    </style>""", unsafe_allow_html=True)
+    st.image(base64.b64decode(_AMERICANA_LOGO_B64), width=200)
+    st.markdown("## 🚨 Report a Breakdown")
+    st.markdown(f"<div class='asset-card'><b>{name}</b><br>Tag: <code>{tag}</code></div>", unsafe_allow_html=True)
+
+    done = st.session_state.get("op_done")
+    if done:
+        st.success(f"✅ Report sent to the maintenance team.\n\n**Reference: {done['ref']}**")
+        st.caption(f"{done['name']} · {done['time']}")
+        if st.button("Report another issue"):
+            st.session_state.op_done = None; st.rerun()
+        return
+
+    with st.form("operator_breakdown"):
+        who = st.text_input("Your name / ID *")
+        status = st.radio("Machine status *", ["🛑 Machine stopped", "⚠️ Running with a problem"])
+        cat = st.selectbox("Problem type", ["Mechanical", "Electrical", "Pneumatic / Hydraulic", "Instrumentation / Control", "Process / Operational", "Other"])
+        safety = st.checkbox("⛔ Safety hazard")
+        desc = st.text_area("What happened? *", placeholder="Describe the problem: noise, smell, alarm code, when it started…", height=120)
+        photo = st.file_uploader("Photo (optional)", type=["jpg", "jpeg", "png"])
+        sent = st.form_submit_button("🚨 SEND BREAKDOWN REPORT")
+    if sent:
+        if not who.strip() or len(desc.strip()) < 5:
+            st.error("Please enter your name and describe the problem.")
+        else:
+            now = datetime.now()
+            rec = {"id": uuid.uuid4().hex, "ref": f"BD-{now.strftime('%y%m%d-%H%M%S')}", "tag": tag, "name": name,
+                   "reported_by": who.strip(), "category": cat, "machine_status": status.split(" ", 1)[1],
+                   "priority": "Critical" if safety else ("High" if "stopped" in status else "Medium"),
+                   "description": desc.strip(), "photo_b64": _compress_photo(photo) if photo is not None else "",
+                   "submitted_at": str(now)}
+            inbox_add(rec)
+            st.session_state.op_done = {"ref": rec["ref"], "name": name, "time": now.strftime("%Y-%m-%d %H:%M")}
+            st.rerun()
+
+_scan_tag = st.query_params.get("r")
+if _scan_tag:
+    operator_report_page(_scan_tag, st.query_params.get("n") or _scan_tag)
+    st.stop()
+
+# --- 5. AUTHENTICATION ---
+if 'user' not in st.session_state:
+    st.session_state.user = None
+if 'role' not in st.session_state:
+    st.session_state.role = None
+if 'wo_counter' not in st.session_state:
+    st.session_state.wo_counter = 1
+
+def login_screen():
+    st.markdown("""
+    <style>
+    .stApp { background-color: #f0f2f5; }
+    .login-box {
+        background: white; padding: 40px; border-radius: 8px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        st.markdown("## 🏭 FactoryPro Login")
+        st.markdown("**Enterprise Access**")
+
+        # Resume previous session BEFORE signing in
+        with st.expander("📂 Resume previous work (upload saved data file)", expanded=False):
+            restore_widget("restore_login")
+            n_docs = sum(len(v) for v in st.session_state.store.values())
+            if n_docs: st.caption(f"✅ Data loaded: {n_docs} records")
+
+        with st.form("login"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign In")
+
+            if submitted:
+                if username == "admin" and password == "admin123":
+                    st.session_state.user = "admin"
+                    st.session_state.role = "Manager"
+                    st.rerun()
+
+                users = load_collection('users')
+                if not users.empty:
+                    user_match = users[users['username'] == username]
+                    if not user_match.empty:
+                        db_pass = user_match.iloc[0].get('password_hash', '')
+                        if db_pass == hash_password(password) or db_pass == password:
+                            st.session_state.user = username
+                            if username == "admin":
+                                st.session_state.role = "Manager"
+                            else:
+                                st.session_state.role = user_match.iloc[0].get('role', 'User')
+                            st.success("Login Successful")
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.error("Invalid Password")
+                    else:
+                        st.error("User not found")
+                else:
+                    st.info("No users stored. Use Master: admin / admin123")
+
+if not st.session_state.user:
+    login_screen()
+    st.stop()
+
+# --- 6. PDF GENERATOR ---
+class PDF(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 15)
+        self.cell(0, 10, 'Americana Foods - EP Plants', 0, 1, 'L')
+        self.set_font('Arial', 'I', 10)
+        self.cell(0, 10, 'Maintenance Work Order', 0, 1, 'L')
+        self.line(10, 30, 200, 30)
+        self.ln(5)
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+
+def create_wo_pdf(wo_data):
+    pdf = PDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=10)
+
+    def get_meta_value(key):
+        meta = wo_data.get('meta')
+        if isinstance(meta, dict):
+            return str(meta.get(key, ''))
+        return ''
+
+    def print_field(label, value):
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(35, 8, label, 0, 0)
+        pdf.set_font("Arial", '', 10)
+        pdf.cell(55, 8, str(value), 0, 0)
+
+    print_field("Product Brand:", get_meta_value('brand'))
+    print_field("Product Type:", wo_data.get('asset_name', ''))
+    pdf.ln(8)
+    print_field("Manufacturer:", get_meta_value('manufacturer'))
+    label_txt = f"{wo_data.get('asset_name', '')} / {get_meta_value('tag')}"
+    print_field("Label:", label_txt)
+    pdf.ln(8)
+    print_field("Section:", get_meta_value('section'))
+    print_field("Tag Number:", get_meta_value('tag'))
+    pdf.ln(8)
+    print_field("Line:", get_meta_value('line'))
+    print_field("Location:", get_meta_value('location'))
+    pdf.ln(8)
+    print_field("Overhaul ID:", wo_data.get('custom_id', ''))
+    pdf.ln(12)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(5)
+
+    pdf.set_font("Arial", 'B', 10)
+    pdf.cell(40, 8, "Check Type:", 0, 0)
+    pdf.set_font("Arial", '', 10)
+    pdf.cell(50, 8, str(wo_data.get('type', '')), 0, 1)
+
+    pdf.set_font("Arial", 'B', 10)
+    pdf.cell(40, 8, "Description:", 0, 0)
+    pdf.set_font("Arial", '', 10)
+    desc = wo_data.get('description', '')
+    pdf.multi_cell(0, 8, str(desc) if isinstance(desc, str) else '')
+    pdf.ln(5)
+
+    pdf.set_fill_color(255, 230, 230)
+    pdf.set_font("Arial", 'B', 9)
+    pdf.multi_cell(0, 8, "SAFETY WARNING: Never perform maintenance unless machine is at complete standstill. LOTO Applied.", 1, 'C', True)
+    pdf.ln(5)
+
+    pdf.set_fill_color(220, 220, 220)
+    pdf.cell(10, 8, "#", 1, 0, 'C', True)
+    pdf.cell(110, 8, "Task Description", 1, 0, 'C', True)
+    pdf.cell(20, 8, "Status", 1, 0, 'C', True)
+    pdf.cell(50, 8, "Remarks", 1, 1, 'C', True)
+
+    tasks = wo_data.get('tasks_data')
+    pdf.set_font("Arial", '', 9)
+    if isinstance(tasks, list) and len(tasks) > 0:
+        for idx, t in enumerate(tasks, 1):
+            if isinstance(t, dict):
+                pdf.cell(10, 8, str(t.get('id', idx)), 1, 0, 'C')
+                pdf.cell(110, 8, str(t.get('desc', '')), 1, 0, 'L')
+                done_mark = "DONE" if t.get('done') else "PENDING"
+                pdf.cell(20, 8, done_mark, 1, 0, 'C')
+                pdf.cell(50, 8, str(t.get('remark', '')), 1, 1, 'L')
+    else:
+        pdf.cell(190, 8, "See General Remarks", 1, 1, 'C')
+    pdf.ln(10)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(5)
+
+    parts = wo_data.get('parts_used', [])
+    if parts and isinstance(parts, list) and len(parts) > 0:
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(0, 8, "Spare Parts & Spendings", 0, 1, 'L')
+        pdf.set_fill_color(240, 240, 240)
+        pdf.set_font("Arial", 'B', 9)
+        pdf.cell(80, 8, "Part Name", 1, 0, 'L', True)
+        pdf.cell(20, 8, "Qty", 1, 0, 'C', True)
+        pdf.cell(30, 8, "Unit Cost", 1, 0, 'R', True)
+        pdf.cell(30, 8, "Total", 1, 1, 'R', True)
+        pdf.set_font("Arial", '', 9)
+        total_parts_cost = 0.0
+        for p in parts:
+            name = str(p.get('name', 'Unknown'))
+            qty = float(p.get('qty', 0))
+            line_total = float(p.get('total_cost', 0))
+            cost = float(p.get('unit_cost', line_total / qty if qty else 0))
+            total_parts_cost += line_total
+            pdf.cell(80, 8, name, 1, 0, 'L')
+            pdf.cell(20, 8, str(qty), 1, 0, 'C')
+            pdf.cell(30, 8, f"${cost:.2f}", 1, 0, 'R')
+            pdf.cell(30, 8, f"${line_total:.2f}", 1, 1, 'R')
+        pdf.set_font("Arial", 'B', 9)
+        pdf.cell(130, 8, "Total Spare Parts Cost:", 1, 0, 'R')
+        pdf.cell(30, 8, f"${total_parts_cost:.2f}", 1, 1, 'C', True)
+        pdf.ln(8)
+    else:
+        pdf.set_font("Arial", 'I', 9)
+        pdf.cell(0, 10, "No spare parts consumed.", 0, 1, 'L')
+
+    tech = wo_data.get('fixing_technician')
+    if not isinstance(tech, str) or not tech:
+        tech = wo_data.get('technician', '')
+    approver = wo_data.get('approver', '')
+    pdf.set_font("Arial", 'B', 10)
+    pdf.cell(90, 10, f"Technician: {tech if isinstance(tech, str) else ''}", 0, 0)
+    pdf.cell(90, 10, f"Approver: {approver if isinstance(approver, str) else ''}", 0, 1)
+
+    return pdf.output(dest='S').encode('latin-1', 'replace')
+
+# --- 7. DATA HANDLING ---
+def generate_overhaul_id(wo_number):
+    now = datetime.now()
+    return f"{wo_number:04d}{now.hour:02d}{now.minute:02d}{now.day:02d}{now.month:02d}{now.year}"
+
+def get_machine_data():
+    st.sidebar.markdown("---")
+    st.sidebar.header("📂 PM Data Source")
+    st.sidebar.caption("Upload file (Machine Name, Site, Section, etc.)")
+    uploaded_file = st.sidebar.file_uploader("Upload Machine List (Optional)", type=['csv', 'xlsx'], key="machine_list_upload")
+
+    if uploaded_file is not None:
+        try:
+            raw, _counts = read_upload_all(uploaded_file)
+            n = normalize_assets_df(raw)
+            return pd.DataFrame({
+                "Machine Name": n["name"], "Brand": "Generic", "Manufacturer": "Generic",
+                "Tag Number": n["tag"], "Frequency": "Standard", "Site": n["site"], "Section": n["section"],
+                "Line": n["line"], "Factory": n["factory"]})
+        except Exception as e:
+            st.sidebar.error(f"Error reading file: {e}")
+            return pd.DataFrame()
+    else:
+        df_assets = load_collection('assets')
+        if not df_assets.empty:
+            return pd.DataFrame({
+                "Machine Name": df_assets.get('name', 'Unknown'),
+                "Brand": df_assets.get('brand', 'Generic'),
+                "Manufacturer": df_assets.get('manufacturer', 'Generic'),
+                "Tag Number": df_assets.get('tag', 'Unknown'),
+                "Frequency": "Standard",
+                "Site": df_assets.get('site', "Unknown"),
+                "Section": df_assets.get('section', "Unknown")
+            })
+        else:
+            return pd.DataFrame(columns=["Machine Name", "Brand", "Manufacturer", "Tag Number", "Site", "Section"])
+
+# --- 8. SIDEBAR (RESTRUCTURED & WHITE TEXT) ---
+with st.sidebar:
+    # 1. Image/Logo at Top
+    st.image("https://cdn-icons-png.flaticon.com/512/906/906343.png", width=60)
+
+    # 2. User Info
+    user_display = st.session_state.get('user', 'User')
+    st.markdown(f"**User: {user_display}**")
+
+    # 3. Connection Status
+    st.markdown("✅ **ERP Connected**")
+
+    st.write("") # Spacer
+
+    # 3b. DATA FILE (replaces the database)
+    st.markdown("### 💾 Data File")
+    if st.session_state.dirty > 0:
+        st.markdown(f"⚠️ **{st.session_state.dirty} unsaved change(s)**")
+    else:
+        st.markdown("✅ All changes saved")
+    st.download_button(
+        "📥 Save Data to File",
+        data=export_backup(),
+        file_name=f"americana_erp_data_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+        mime="application/json",
+        key="download_backup",
+        on_click=lambda: st.session_state.update(dirty=0),
+    )
+    with st.expander("📂 Load Data from File", expanded=False):
+        restore_widget("restore_sidebar")
+
+    st.write("")
+
+    # 4. Alerts
+    st.markdown("### 🔔 Alerts")
+    notes_data = fetch_notifications()
+    with st.expander("Latest Messages", expanded=False):
+        if notes_data:
+            for n_data in notes_data:
+                ts = n_data.get('timestamp')
+                time_str = ts.strftime("%H:%M") if pd.notna(ts) else ""
+                st.markdown(f"**{time_str}** {n_data.get('message', '')}")
+        else:
+            st.markdown("No notifications.")
+
+    _pending_qr = len(inbox_load())
+    if _pending_qr:
+        st.markdown(f"🚨 **{_pending_qr} new QR breakdown report(s)** - open *Breakdown Reporting*")
+        if not st.session_state.get("_qr_toasted"):
+            st.toast(f"{_pending_qr} new breakdown report(s) from QR scans", icon="🚨"); st.session_state._qr_toasted = True
+
+    st.write("") # Spacer
+
+    # 5. Logout Button
+    if st.button("LOGOUT", type="primary"):
+        st.session_state.user = None
+        st.rerun()
+
+    st.write("") # Spacer
+
+    # 6. Menu Modules (AT BOTTOM)
+    st.markdown("**ERP Modules**")
+    menu_options = ["📊 Dashboard", "🤖 Migo Chatbot", "🛠️ Asset Master Data", "📅 Planned Maintenance", "🔧 Work Orders", "📦 Inventory", "🚨 Breakdown Reporting"]
+
+    if st.session_state.role == "Manager" or st.session_state.user == "admin":
+         menu_options.append("💼 Maintenance Manager")
+
+    menu = st.radio("ERP Modules", menu_options, label_visibility="collapsed")
+
+# --- APPLY SAP STYLE ---
+add_sap_styling(menu)
+
+# =====================================================================
+# --- QR LABEL ENGINE (styled QR + logo + printable A4 label sheets) ---
+# =====================================================================
+import os
+import tempfile
+from PIL import ImageDraw, ImageFont
+
+def _qr_font(size, bold=True):
+    names = (["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "arialbd.ttf", "Arial Bold.ttf"] if bold
+             else ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "arial.ttf", "Arial.ttf"])
+    for n in names:
+        try: return ImageFont.truetype(n, size)
+        except Exception: pass
+    try: return ImageFont.load_default(size)
+    except Exception: return ImageFont.load_default()
+
+
 def default_logo_png():
     """Built-in Americana logo (PNG, transparent background)."""
     import base64
@@ -1229,13 +1355,13 @@ def asset_label_fields(row):
     name, tag, aid = clean(row.get("name")), clean(row.get("tag")), clean(row.get("id"))
     loc = " / ".join(x for x in [clean(row.get("site")), clean(row.get("section")), clean(row.get("line"))] if x)
     display_id = tag or aid[:8].upper()
-    payload = f"ID:{aid}\nTag:{tag}\nName:{name}"
+    payload = build_scan_url(get_app_url(), tag or aid, name or display_id)   # scan -> breakdown report form
     return display_id, name, loc, payload
 
 def make_label_png(display_id, name, payload, logo_bytes=b""):
     """Single printable label image: header band, QR with logo, asset ID below."""
     qr = Image.open(io.BytesIO(make_qr_png(payload, logo_bytes))).convert("RGB")
-    W = qr.size[0]; pad = 30; head = 120; foot = 120
+    W = qr.size[0]; pad = 30; head = 120; foot = 150
     canvas = Image.new("RGB", (W + 2 * pad, head + W + foot), "white"); d = ImageDraw.Draw(canvas)
     hl = logo_on_white(logo_bytes); hh_px = head - 30
     hl = hl.resize((int(hl.size[0] * hh_px / hl.size[1]), hh_px), Image.LANCZOS)
@@ -1250,6 +1376,7 @@ def make_label_png(display_id, name, payload, logo_bytes=b""):
         f_id = _qr_font(f_id.size - 4)
     center(display_id, head + W + 12, f_id, (27, 42, 58))
     center(name[:40], head + W + 72, _qr_font(26, bold=False), (90, 100, 110))
+    center("Scan to report a breakdown", head + W + 112, _qr_font(24), (214, 48, 49))
     d.rectangle((0, 0, canvas.size[0] - 1, canvas.size[1] - 1), outline=(180, 190, 200), width=3)
     buf = io.BytesIO(); canvas.save(buf, "PNG"); return buf.getvalue()
 
@@ -1287,6 +1414,8 @@ def create_qr_labels_pdf(df, logo_bytes=b"", cols=3, rows=4, progress=None):
         pdf.set_font("Arial", "", 7.5); pdf.set_text_color(90, 100, 110)
         pdf.cell(cw - 2, 4, _lat(name[:40]), 0, 2, "C")
         if loc: pdf.cell(cw - 2, 4, _lat(loc[:44]), 0, 2, "C")
+        pdf.set_font("Arial", "B", 6.5); pdf.set_text_color(214, 48, 49)
+        pdf.cell(cw - 2, 3.5, "SCAN TO REPORT A BREAKDOWN", 0, 2, "C")
         if progress and (i % 5 == 0 or i == n - 1): progress((i + 1) / max(n, 1))
     try:
         os.remove(hl_path); os.rmdir(tmp)
@@ -2550,6 +2679,14 @@ elif menu == "🛠️ Asset Master Data":
                 st.caption("The Americana logo is built in and appears in the centre of every QR and in the label header. High error-correction (30%) keeps every code scannable.")
             logo_bytes = st.session_state.get("qr_logo", b"")
 
+            with st.expander("🔗 Scan-to-report link (what the QR opens)", expanded=False):
+                cur_url = get_app_url()
+                new_url = st.text_input("App address operators open after scanning", value=cur_url)
+                if new_url.strip().rstrip("/") != cur_url and new_url.strip():
+                    set_setting("app_url", new_url.strip().rstrip("/")); st.rerun()
+                st.caption("Example link encoded in a QR:"); st.code(build_scan_url(cur_url, "AMER-EP01-SP11-CLX", "Clextral"))
+                st.caption("Scanning opens the breakdown form for that machine (no login). Labels printed before this change must be reprinted.")
+
             st.markdown("#### Single asset")
             df_assets['qr_display'] = df_assets['name'].astype(str) + " / " + df_assets['tag'].fillna('').astype(str)
             qr_selection = st.selectbox("Select Asset", df_assets['qr_display'].unique())
@@ -2634,6 +2771,12 @@ elif menu == "🔧 Work Orders":
                 with st.expander(f"{row.get('custom_id')} - {row.get('asset_name')}"):
                     desc = row.get('description')
                     if isinstance(desc, str): st.write(desc)
+                    _info = [str(row.get(k)) for k in ('reported_by', 'machine_status', 'priority') if isinstance(row.get(k), str) and row.get(k)]
+                    if _info: st.caption("Reported via QR · " + " · ".join(_info))
+                    _ph = row.get('photo_b64')
+                    if isinstance(_ph, str) and _ph:
+                        try: st.image(base64.b64decode(_ph), width=280)
+                        except Exception: pass
                     tasks = safe_list(row.get('tasks_data'))
                     new_tasks = []
                     for t in tasks:
@@ -2692,6 +2835,36 @@ elif menu == "📦 Inventory":
 # --- MODULE 6: BREAKDOWN ---
 elif menu == "🚨 Breakdown Reporting":
     st.title("🚨 Report Breakdown")
+    st.subheader("📥 Reports received from QR scans")
+    pending = inbox_load()
+    if pending:
+        st.warning(f"{len(pending)} new report(s) waiting. Import them to create Open Breakdown work orders.")
+        tbl = pd.DataFrame([{"Ref": p.get("ref"), "Time": str(p.get("submitted_at", ""))[:16], "Asset": p.get("name"), "Tag": p.get("tag"),
+                             "Reported by": p.get("reported_by"), "Type": p.get("category"), "Machine": p.get("machine_status"),
+                             "Priority": p.get("priority"), "Issue": p.get("description"), "Photo": "📷" if p.get("photo_b64") else ""} for p in pending])
+        st.dataframe(one_based(tbl), use_container_width=True)
+        qc1, qc2 = st.columns(2)
+        if qc1.button("✅ Import all as Work Orders", key="inbox_import"):
+            asset_docs = {str(d.get("tag", "")).strip().lower(): d for d in st.session_state.store.get("assets", [])}
+            for p in pending:
+                ad = asset_docs.get(str(p.get("tag", "")).strip().lower(), {})
+                wo = {"custom_id": generate_overhaul_id(st.session_state.wo_counter),
+                      "asset_name": f"{p.get('name', '')} {p.get('tag', '')}".strip(), "type": "Breakdown", "status": "Open",
+                      "description": f"[{p.get('category', '')}] {p.get('description', '')}", "created_at": p.get("submitted_at", str(datetime.now())),
+                      "priority": p.get("priority", "High"), "reported_by": p.get("reported_by", ""), "machine_status": p.get("machine_status", ""),
+                      "source": "QR scan", "photo_b64": p.get("photo_b64", ""), "total_cost": 0.0,
+                      "meta": {"tag": p.get("tag", ""), "section": ad.get("section", ""), "line": ad.get("line", ""), "location": ad.get("site", ""), "manufacturer": ad.get("manufacturer", ""), "brand": ad.get("brand", "")}}
+                save_document("work_orders", wo, notify=False)
+                st.session_state.wo_counter += 1
+            inbox_remove([p["id"] for p in pending])
+            log_notification(f"🚨 {len(pending)} breakdown report(s) imported from QR scans")
+            st.success(f"Imported {len(pending)} report(s) as Open Breakdown work orders."); time.sleep(1); st.rerun()
+        if qc2.button("🗑️ Discard all", key="inbox_discard"):
+            inbox_remove([p["id"] for p in pending]); st.rerun()
+        st.caption("Remember to **📥 Save Data to File** after importing.")
+    else:
+        st.info("No new QR reports.")
+    st.divider(); st.subheader("Report manually")
     a = st.text_input("Asset"); d = st.text_area("Issue")
     if st.button("Report"):
         save_document('work_orders', {"type": "Breakdown", "asset_name": a, "description": d, "status": "Open", "created_at": str(datetime.now()), "priority": "High", "total_cost": 0.0})
