@@ -2705,4 +2705,11 @@ elif menu == "💼 Maintenance Manager":
     risk = st.number_input("Risk", 50000)
     total = base * (1 + inf) + risk
     st.metric("2026 Forecast", f"${total:,.0f}")
-    st.plotly_chart(go.Figure(go.Waterfall(measure=["relative", "relative", "relative", "total"], x=["Base", "Inflation", "Risk", "Total"], y=[base, base*inf, risk, total]))) risk, total])))
+    waterfall = go.Waterfall(
+        measure=["relative", "relative", "relative", "total"],
+        x=["Base", "Inflation", "Risk", "Total"],
+        y=[base, base * inf, risk, total],
+    )
+    st.plotly_chart(go.Figure(waterfall), use_container_width=True)
+
+# ---- END OF FILE (app.py) - if you can see this line on GitHub, the file was uploaded completely ----
