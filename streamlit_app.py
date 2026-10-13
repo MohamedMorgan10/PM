@@ -317,6 +317,11 @@ def add_sap_styling(module_name):
             font-weight: bold;
         }}
 
+        /* METRIC CARDS: wrap long values/labels instead of cutting them with "..." */
+        div[data-testid="stMetricValue"] > div, div[data-testid="stMetricLabel"] p {{
+            white-space: normal !important; overflow: visible !important; text-overflow: clip !important; word-break: break-word;
+        }}
+
         /* DATAFRAME HEADERS */
         thead tr th:first-child {{display:none}}
         tbody th {{display:none}}
@@ -1760,6 +1765,15 @@ def cur_label():
 def fmt_cur(x, digits=0):
     try: return f"{cur_label()} {float(x):,.{digits}f}"
     except Exception: return str(x)
+
+def fmt_short(x):
+    """Compact amount for KPI cards: EGP 2.19 M / EGP 245 K / EGP 850."""
+    try: v = float(x)
+    except Exception: return str(x)
+    a = abs(v)
+    if a >= 1e6: return f"{cur_label()} {v / 1e6:,.2f} M"
+    if a >= 1e4: return f"{cur_label()} {v / 1e3:,.0f} K"
+    return f"{cur_label()} {v:,.0f}"
 
 def machine_table(f):
     """One row per machine (tag) with spend, lines, share and cumulative share."""
@@ -3354,6 +3368,10 @@ elif menu == "💰 OPEX & Spend Analysis":
     st.caption("Upload the monthly spare-parts issue report (ERP) to analyse spending per plant, line, machine, part category and compare it with the CMMS.")
     cur = cur_label()
     d_all = opex_df()
+    st.markdown("""<style>
+    div[data-testid="stMetricValue"] {font-size: 1.7rem !important;}
+    div[data-testid="stMetricValue"] > div, div[data-testid="stMetricLabel"] p, div[data-testid="stMetricDelta"] > div {white-space: normal !important; overflow: visible !important; text-overflow: clip !important; word-break: break-word;}
+    </style>""", unsafe_allow_html=True)
 
     @st.cache_data(show_spinner="Reading report…")
     def _parse_cached(raw_bytes, fname):
@@ -3443,12 +3461,17 @@ elif menu == "💰 OPEX & Spend Analysis":
         # ---------------- overview ----------------
         with t_ov:
             tot = f["value"].sum()
-            k = st.columns(6)
-            k[0].metric("💰 Total spend", fmt_cur(tot)); k[1].metric("🧾 Issue lines", f"{len(f):,}")
-            k[2].metric("⚙️ Machines with spend", f.loc[f["tagged"], "machine_label"].nunique())
-            k[3].metric("📐 Avg per machine", fmt_cur(mt_tag["Spend"].mean() if not mt_tag.empty else 0))
-            k[4].metric("🏆 Top machine", (mt_tag.iloc[0]["Machine"] if not mt_tag.empty else "-"), delta=fmt_cur(mt_tag.iloc[0]["Spend"]) if not mt_tag.empty else None, delta_color="off")
-            k[5].metric("🏷️ Spend with machine tag", f"{f.loc[f['tagged'], 'value'].sum() / tot * 100:.1f}%")
+            top_m = mt_tag.iloc[0] if not mt_tag.empty else None
+            avg_m = mt_tag["Spend"].mean() if not mt_tag.empty else 0
+            k1 = st.columns(3)
+            k1[0].metric("💰 Total spend", fmt_short(tot), help=fmt_cur(tot, 2))
+            k1[1].metric("🧾 Issue lines", f"{len(f):,}")
+            k1[2].metric("⚙️ Machines with spend", f.loc[f["tagged"], "machine_label"].nunique())
+            k2 = st.columns(3)
+            k2[0].metric("📐 Avg per machine", fmt_short(avg_m), help=fmt_cur(avg_m, 2))
+            k2[1].metric("🏆 Top machine", top_m["Machine"] if top_m is not None else "-", delta=fmt_short(top_m["Spend"]) if top_m is not None else None, delta_color="off",
+                         help=(f"{top_m['Machine']} ({top_m['Tag']}): {fmt_cur(top_m['Spend'], 2)}" if top_m is not None else None))
+            k2[2].metric("🏷️ Spend with machine tag", f"{f.loc[f['tagged'], 'value'].sum() / tot * 100:.1f}%")
             c1, c2 = st.columns(2)
             by_pl = f.groupby("plant")["value"].sum().reset_index()
             c1.plotly_chart(px.pie(by_pl, names="plant", values="value", hole=0.5, title="Spend by plant"), use_container_width=True)
