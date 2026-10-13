@@ -641,6 +641,117 @@ with st.sidebar:
 add_sap_styling(menu)
 
 # =====================================================================
+# --- QR LABEL ENGINE (styled QR + logo + printable A4 label sheets) ---
+# =====================================================================
+import os
+import tempfile
+from PIL import ImageDraw, ImageFont
+
+def _qr_font(size, bold=True):
+    names = (["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "arialbd.ttf", "Arial Bold.ttf"] if bold
+             else ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "arial.ttf", "Arial.ttf"])
+    for n in names:
+        try: return ImageFont.truetype(n, size)
+        except Exception: pass
+    try: return ImageFont.load_default(size)
+    except Exception: return ImageFont.load_default()
+
+def default_logo_png():
+    """Fallback badge (monogram) used until the real Americana Foods logo is uploaded."""
+    size = 400
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0)); d = ImageDraw.Draw(img)
+    d.ellipse((0, 0, size - 1, size - 1), fill=(200, 16, 46, 255))
+    d.ellipse((22, 22, size - 23, size - 23), outline=(255, 255, 255, 255), width=10)
+    f = _qr_font(170); bb = d.textbbox((0, 0), "AF", font=f)
+    d.text(((size - (bb[2] - bb[0])) / 2 - bb[0], (size - (bb[3] - bb[1])) / 2 - bb[1]), "AF", font=f, fill=(255, 255, 255, 255))
+    buf = io.BytesIO(); img.save(buf, "PNG"); return buf.getvalue()
+
+@st.cache_data(show_spinner=False, max_entries=3000)
+def make_qr_png(payload, logo_bytes=b""):
+    """QR with HIGH error correction (30%) and the logo centred on a white rounded badge (22% of width)."""
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=8, border=2)
+    qr.add_data(payload); qr.make(fit=True)
+    img = qr.make_image(fill_color="#1b2a3a", back_color="white")
+    img = (img.get_image() if hasattr(img, "get_image") else img).convert("RGB")
+    W = img.size[0]
+    logo = Image.open(io.BytesIO(logo_bytes or default_logo_png())).convert("RGBA")
+    target = int(W * 0.22)
+    logo.thumbnail((target, target), Image.LANCZOS)
+    pad = max(4, int(target * 0.14))
+    bw, bh = logo.size[0] + 2 * pad, logo.size[1] + 2 * pad
+    badge = Image.new("RGBA", (bw, bh), (255, 255, 255, 0))
+    ImageDraw.Draw(badge).rounded_rectangle((0, 0, bw - 1, bh - 1), radius=int(min(bw, bh) * 0.2), fill=(255, 255, 255, 255))
+    badge.alpha_composite(logo, (pad, pad))
+    img.paste(badge, ((W - bw) // 2, (W - bh) // 2), badge)
+    buf = io.BytesIO(); img.save(buf, "PNG"); return buf.getvalue()
+
+def asset_label_fields(row):
+    def clean(v):
+        v = "" if v is None else str(v)
+        return "" if v.strip().lower() in ("nan", "none") else v.strip()
+    name, tag, aid = clean(row.get("name")), clean(row.get("tag")), clean(row.get("id"))
+    loc = " / ".join(x for x in [clean(row.get("site")), clean(row.get("section")), clean(row.get("line"))] if x)
+    display_id = tag or aid[:8].upper()
+    payload = f"ID:{aid}\nTag:{tag}\nName:{name}"
+    return display_id, name, loc, payload
+
+def make_label_png(display_id, name, payload, logo_bytes=b""):
+    """Single printable label image: header band, QR with logo, asset ID below."""
+    qr = Image.open(io.BytesIO(make_qr_png(payload, logo_bytes))).convert("RGB")
+    W = qr.size[0]; pad = 30; head = 60; foot = 120
+    canvas = Image.new("RGB", (W + 2 * pad, head + W + foot), "white"); d = ImageDraw.Draw(canvas)
+    d.rectangle((0, 0, canvas.size[0], head), fill=(53, 74, 95))
+    def center(text, y, font, fill):
+        bb = d.textbbox((0, 0), text, font=font); d.text(((canvas.size[0] - (bb[2] - bb[0])) / 2 - bb[0], y), text, font=font, fill=fill)
+    center("AMERICANA FOODS", 14, _qr_font(30), "white")
+    canvas.paste(qr, (pad, head + 5))
+    f_id = _qr_font(44)
+    while d.textbbox((0, 0), display_id, font=f_id)[2] > canvas.size[0] - 20 and f_id.size > 16:
+        f_id = _qr_font(f_id.size - 4)
+    center(display_id, head + W + 12, f_id, (27, 42, 58))
+    center(name[:40], head + W + 72, _qr_font(26, bold=False), (90, 100, 110))
+    d.rectangle((0, 0, canvas.size[0] - 1, canvas.size[1] - 1), outline=(180, 190, 200), width=3)
+    buf = io.BytesIO(); canvas.save(buf, "PNG"); return buf.getvalue()
+
+def _lat(t): return str(t).encode("latin-1", "replace").decode("latin-1")
+
+def create_qr_labels_pdf(df, logo_bytes=b"", cols=3, rows=4, progress=None):
+    """A4 sheet(s) of labels ready to print and stick on machines."""
+    pdf = FPDF("P", "mm", "A4"); pdf.set_auto_page_break(False)
+    mx, my = 8, 10
+    cw, ch = (210 - 2 * mx) / cols, (297 - 2 * my) / rows
+    per, hh = cols * rows, 7
+    tmp = tempfile.mkdtemp(); n = len(df)
+    for i, (_, row) in enumerate(df.iterrows()):
+        if i % per == 0: pdf.add_page()
+        k = i % per; x = mx + (k % cols) * cw; y = my + (k // cols) * ch
+        display_id, name, loc, payload = asset_label_fields(row)
+        pdf.set_draw_color(170, 180, 190); pdf.set_line_width(0.3); pdf.rect(x + 1, y + 1, cw - 2, ch - 2)
+        pdf.set_fill_color(53, 74, 95); pdf.rect(x + 1, y + 1, cw - 2, hh, "F")
+        pdf.set_xy(x + 1, y + 1 + 1.2); pdf.set_font("Arial", "B", 8); pdf.set_text_color(255, 255, 255)
+        pdf.cell(cw - 2, 4.5, "AMERICANA FOODS", 0, 0, "C")
+        qr_size = min(cw - 10, ch - hh - 24)
+        path = os.path.join(tmp, f"q{i}.png")
+        with open(path, "wb") as fh: fh.write(make_qr_png(payload, logo_bytes))
+        pdf.image(path, x + (cw - qr_size) / 2, y + 1 + hh + 2, qr_size, qr_size)
+        try: os.remove(path)
+        except Exception: pass
+        fs = 12 if cols <= 2 else 10.5 if cols == 3 else 9
+        pdf.set_font("Arial", "B", fs); txt = _lat(display_id)
+        while pdf.get_string_width(txt) > cw - 6 and fs > 5:
+            fs -= 0.5; pdf.set_font("Arial", "B", fs)
+        pdf.set_text_color(27, 42, 58); pdf.set_xy(x + 1, y + 1 + hh + 2 + qr_size + 1.5)
+        pdf.cell(cw - 2, 5.5, txt, 0, 2, "C")
+        pdf.set_font("Arial", "", 7.5); pdf.set_text_color(90, 100, 110)
+        pdf.cell(cw - 2, 4, _lat(name[:40]), 0, 2, "C")
+        if loc: pdf.cell(cw - 2, 4, _lat(loc[:44]), 0, 2, "C")
+        if progress and (i % 5 == 0 or i == n - 1): progress((i + 1) / max(n, 1))
+    try: os.rmdir(tmp)
+    except Exception: pass
+    return pdf.output(dest="S").encode("latin-1", "replace")
+
+
+# =====================================================================
 # --- 9. MIGO AI / NLP ENGINE ---
 # Hybrid NLP pipeline (100% local, no API needed):
 #   1. Rule layer        -> high-precision regex for KPI words (MTTR, OEE, ...)
@@ -1866,15 +1977,51 @@ elif menu == "🛠️ Asset Master Data":
 
     with tab3:
         st.subheader("Generate Machine QR Codes")
-        if not df_assets.empty:
+        if df_assets.empty:
+            st.warning("Add assets first.")
+        else:
+            with st.expander("🖼️ Logo inside the QR (Americana Foods)", expanded=False):
+                lg = st.file_uploader("Upload the Americana Foods logo (PNG with transparent background works best)", type=["png", "jpg", "jpeg"], key="qr_logo_upload")
+                if lg is not None: st.session_state.qr_logo = lg.getvalue()
+                if st.session_state.get("qr_logo") and st.button("Remove uploaded logo", key="qr_logo_reset"):
+                    st.session_state.qr_logo = b""; st.rerun()
+                st.caption("Until you upload the real logo, a placeholder 'AF' badge is used. High error-correction (30%) keeps every code scannable with the logo in the centre.")
+            logo_bytes = st.session_state.get("qr_logo", b"")
+
+            st.markdown("#### Single asset")
             df_assets['qr_display'] = df_assets['name'].astype(str) + " / " + df_assets['tag'].fillna('').astype(str)
             qr_selection = st.selectbox("Select Asset", df_assets['qr_display'].unique())
             if st.button("Generate QR"):
                 row = df_assets[df_assets['qr_display'] == qr_selection].iloc[0]
-                qr = qrcode.make(f"ID:{row['id']}\nName:{row['name']}")
-                buf = io.BytesIO(); qr.save(buf, format="PNG"); byte_im = buf.getvalue()
-                st.image(byte_im, caption=row['name']); st.download_button("Download", byte_im, "qr.png")
-        else: st.warning("Add assets first.")
+                did, nm, loc, payload = asset_label_fields(row)
+                byte_im = make_label_png(did, nm, payload, logo_bytes)
+                st.image(byte_im, width=300, caption=nm)
+                st.download_button("Download", byte_im, f"qr_{did}.png", "image/png")
+
+            st.divider()
+            st.markdown("#### 🖨️ Bulk QR labels - all assets (printable PDF)")
+            f_df = df_assets
+            fc = st.columns(3)
+            for (col, lab), box in zip([("site", "Site"), ("section", "Section"), ("line", "Line")], fc):
+                if col in f_df.columns:
+                    opts = sorted(f_df[col].dropna().astype(str).unique())
+                    sel = box.multiselect(lab, opts, key=f"qr_f_{col}")
+                    if sel: f_df = f_df[f_df[col].astype(str).isin(sel)]
+            layout = st.selectbox("Labels per A4 page", ["12 labels (3 x 4) - recommended", "6 labels (2 x 3) - large", "20 labels (4 x 5) - small"])
+            cols_n, rows_n = {"12": (3, 4), "6": (2, 3), "20": (4, 5)}[layout.split()[0]]
+            st.caption(f"{len(f_df)} assets selected · about {-(-len(f_df) // (cols_n * rows_n))} page(s)." + (" Large lists can take a minute." if len(f_df) > 300 else ""))
+            if st.button("🧾 Generate All QR Labels", key="qr_bulk_btn"):
+                if f_df.empty:
+                    st.warning("No assets selected.")
+                else:
+                    bar = st.progress(0.0, text="Generating QR labels…")
+                    pdf_bytes = create_qr_labels_pdf(f_df, logo_bytes, cols_n, rows_n, progress=lambda p: bar.progress(p, text=f"Generating QR labels… {int(p * 100)}%"))
+                    bar.empty()
+                    st.session_state.qr_pdf = {"bytes": pdf_bytes, "count": len(f_df), "stamp": datetime.now().strftime("%Y%m%d_%H%M")}
+            if st.session_state.get("qr_pdf"):
+                q = st.session_state.qr_pdf
+                st.success(f"✅ {q['count']} QR labels ready.")
+                st.download_button("📥 Download All QR Labels (PDF)", q["bytes"], f"Americana_QR_Labels_{q['stamp']}.pdf", "application/pdf", key="qr_bulk_dl")
 
 # --- MODULE 3: PLANNED MAINTENANCE ---
 elif menu == "📅 Planned Maintenance":
