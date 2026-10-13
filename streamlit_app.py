@@ -131,7 +131,7 @@ except ImportError:
 # The user downloads it as a JSON backup file and uploads it again to resume.
 APP_ID = "Americana ERP - PM Module"
 BACKUP_VERSION = 1
-COLLECTIONS = ["users", "assets", "pm_plans", "work_orders", "spare_parts", "breakdowns", "notifications", "chat_sessions", "settings", "documents"]
+COLLECTIONS = ["users", "assets", "pm_plans", "work_orders", "spare_parts", "breakdowns", "notifications", "chat_sessions", "settings", "documents", "opex"]
 
 # Columns guaranteed to exist (prevents KeyErrors on empty / partial data)
 DEFAULT_COLUMNS = {
@@ -216,7 +216,8 @@ def add_sap_styling(module_name):
         "🔧 Work Orders": "linear-gradient(to top, #dfe9f3 0%, white 100%)",
         "📦 Inventory": "linear-gradient(to right, #ece9e6, #ffffff)",
         "🚨 Breakdown Reporting": "linear-gradient(to right, #ffecd2 0%, #fcb69f 100%)",
-        "💼 Maintenance Manager": "linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%)"
+        "💼 Maintenance Manager": "linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%)",
+        "💰 OPEX & Spend Analysis": "linear-gradient(135deg, #eef2f7 0%, #d5e3f0 100%)"
     }
 
     bg_style = backgrounds.get(module_name, "white")
@@ -1024,7 +1025,9 @@ def publish_snapshot():
     snap = {"published_at": str(datetime.now()), "pin_hash": get_setting("tech_pin_hash", ""),
             "assets": s.get("assets", []), "work_orders": wos, "pm_plans": s.get("pm_plans", []),
             "spare_parts": [{k: p.get(k) for k in ("name", "sku", "quantity", "location", "cost")} for p in s.get("spare_parts", [])],
-            "documents": [{k: v for k, v in d.items() if k != "data_b64"} for d in docs]}
+            "documents": [{k: v for k, v in d.items() if k != "data_b64"} for d in docs],
+            "parts_used": [{"tag": r.get("tag"), "item_code": r.get("item_code"), "description": r.get("description"), "qty": -(r.get("issue_qty") or 0), "date": r.get("gl_date")}
+                           for r in s.get("opex", []) if r.get("tag") and r.get("period") in sorted({x.get("period") for x in s.get("opex", []) if x.get("period")})[-12:]]}
     with _inbox_lock():
         keep = set()
         for d in docs:
@@ -1095,7 +1098,8 @@ def _tech_view(tag, name):
             st.dataframe(pd.DataFrame({"Field": [k.title() for k in asset if k not in ("id", "created_at")], "Value": [str(v) for k, v in asset.items() if k not in ("id", "created_at")]}), use_container_width=True, hide_index=True)
         else: st.write(f"{name} · {tag} (not found in the published asset list)")
 
-    t_open, t_pm, t_hist, t_docs, t_parts = st.tabs([f"🔧 Open WOs ({len(open_)})", f"📅 PM ({len(plans)})", "📜 History", f"📚 Documents ({len(docs)})", "📦 Spare parts"])
+    used = [u for u in snap.get("parts_used", []) if str(u.get("tag", "")).lower() == tl]
+    t_open, t_pm, t_hist, t_docs, t_used, t_parts = st.tabs([f"🔧 Open WOs ({len(open_)})", f"📅 PM ({len(plans)})", "📜 History", f"📚 Documents ({len(docs)})", f"🔩 Parts used ({len(used)})", "📦 Stock"])
     with t_open:
         if not open_: st.success("No open work orders for this machine. 🎉")
         for w in sorted(open_, key=lambda x: str(x.get("created_at", ""))):
@@ -1136,6 +1140,13 @@ def _tech_view(tag, name):
                 if st.checkbox("Prepare download", key=f"prep_{d['id']}"):
                     with open(path, "rb") as fh: data = fh.read()
                     st.download_button(f"⬇️ {d.get('filename')}", data, d.get("filename"), d.get("mime") or "application/octet-stream", key=f"dl_{d['id']}")
+    with t_used:
+        if not used: st.info("No spare parts issued to this machine in the loaded spend reports.")
+        else:
+            ud = pd.DataFrame(used)
+            gu = ud.groupby(["item_code", "description"]).agg(Qty=("qty", "sum"), Issues=("qty", "size"), Last=("date", "max")).reset_index().sort_values("Last", ascending=False)
+            st.caption(f"{len(used)} issue lines · {len(gu)} different parts (most recent first)")
+            st.dataframe(one_based(gu.rename(columns={"item_code": "Item code", "description": "Description", "Last": "Last issued"})), use_container_width=True)
     with t_parts:
         q = st.text_input("Search spare parts", key="tech_part_q").strip().lower()
         parts = [p for p in snap.get("spare_parts", []) if not q or q in str(p.get("name", "")).lower() or q in str(p.get("sku", "")).lower()][:40]
@@ -1443,6 +1454,7 @@ with st.sidebar:
     menu_options = ["📊 Dashboard", "🤖 Migo Chatbot", "🛠️ Asset Master Data", "📅 Planned Maintenance", "🔧 Work Orders", "📦 Inventory", "🚨 Breakdown Reporting"]
 
     if st.session_state.role == "Manager" or st.session_state.user == "admin":
+         menu_options.append("💰 OPEX & Spend Analysis")
          menu_options.append("💼 Maintenance Manager")
 
     menu = st.radio("ERP Modules", menu_options, label_visibility="collapsed")
@@ -1580,6 +1592,310 @@ def create_qr_labels_pdf(df, logo_bytes=b"", cols=3, rows=4, progress=None):
 
 
 # =====================================================================
+# --- OPEX / SPEND ANALYSIS ENGINE ---
+# Reads the monthly ERP spare-parts issue report (Dept = "Machine ((TAG))", General Dept = "Plant-Section-Line"),
+# normalises it, links it to the asset master by tag number and provides the analytics used by the
+# "OPEX & Spend Analysis" module, Migo and the technician QR page.
+# =====================================================================
+ITEM_GROUPS = {"6081": "Electrical & Electronics", "6082": "Mechanical", "6083": "Pneumatic, Hoses & Pipes", "6084": "Consumables & Materials"}
+PLANT_BY_ACCOUNT = {"30001": "Snacks", "30002": "Pellet", "30000": "Central Workshops"}
+AR_DEPT = {"الورش": "Workshops", "ماكينات البالت": "Pellet Machines", "ورشة لف المواتير": "Motor Rewinding Workshop",
+           "ورشة": "Workshop", "عام": "General (no machine)"}
+MONTHS = {m: i + 1 for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+
+# Part-category rules (Arabic + English keywords) - first match wins; user rules (Settings) are checked first.
+CATEGORY_RULES = [
+    ("Printing & Coding", r"طباعة|طباعه|ايشيدا|إيشيدا|اشيدا|ماركم|markem|دومينو|domino|print|حبر|\bink\b|ريبون|ribbon|سلونايت|كارج|صداده|thermal|ثيرمال"),
+    ("PLC, Cards & Electronics", r"\bplc\b|pwb|كارت|كارته|كارتة|\bcard\b|6es7|\bhmi\b|شاشة|screen|حساس|sensor|ريلاى|ريلية|ريليه|relay|\bscr\b|سولد استيت|كونتاكتور|contactor|فيوز|fuse|بريكر|breaker|تايمر|timer|ثرموكوبل|thermocouple|بروكسيمتى|proximity|encoder|ascon|tecnologic|سيفتى|safety|power supply|connector|socket|سوكت|كويل|coil|\bssr\b|بوتون|مفتاح كهرب"),
+    ("Motors, Gearboxes & Drives", r"موتور|ماتور|motor|جير|gearbox|اكسترودر|extruder|مجموعة \d+|مجموعه \d+|inverter|انفرتر|درايف|\bdrive\b|مضخة|\bpump\b|مروحة|\bfan\b"),
+    ("Bearings & Housings", r"رولمان|\bبلى\b|بلية|بلي|bearing|كرسى بلى|كرسي بلي|كراسي"),
+    ("Oil Seals & Gaskets", r"اويل سيل|أويل سيل|oil seal|جوان|gasket|o-?ring|اورنج"),
+    ("Belts & Chains", r"\bسير\b|حزام|\bbelt\b|جنزير|سلسلة|\bchain\b|كوبلنج|coupling"),
+    ("Pneumatics, Hoses & Pipes", r"بستم|هواء|pneumatic|خرطوم|\bhose\b|سلندر|cylinder|فلتر|filter|ريجيوليتر|regulator|valve|محبس|صمام|solenoid|سولينويد|وصلة|fitting|\btube\b|\bpipe\b|ماسورة|مواسير|كوع|steam"),
+    ("Mechanical Parts (gears, shafts, springs)", r"ترس|\bgear\b|عمود|shaft|فلانش|flange|سوسته|spring|ارتيلون|أرتيلون|مبروم|خوص|شيكا|بكره|بكرة|عجلة|wheel|roller|ساند|حلزون|بنطة|بنطه|سيخ|شبك|ذراع|غطاء|بالته|قاعده|قاعدة|هد ماكينة"),
+    ("Heating, Sealing & Cutting", r"تيفلون|teflon|سكينه|سكينة|knife|blade|نصل|مقاومة|heater|\bjaw\b|فك|لحام|سيلكون|silicone|ربر|rubber|كاوتش|heat seal|band|سخان"),
+    ("Fasteners & Hardware", r"مسمار|صامولة|وردة|بولت|\bbolt\b|\bscrew\b|\bnut\b|washer|زرجينة|جلبة|بوشة|\bbush\b|مفتاح الن|rivet|مسامير"),
+    ("Cables & Wires", r"كابل|cable|سلك|\bwire\b|فيشة|\bplug\b|شريط"),
+    ("Lubricants & Chemicals", r"زيت|\boil\b|شحم|grease|جريس|اسبراى|spray|\bcrc\b|لوكتايت|loctite|سوليشن|كيماوى"),
+    ("Tools & Safety", r"مسدس|\btool\b|عدة|كماشة|مفك|drill|لقمة|قفاز|glove|خوذة"),
+]
+
+def _clean(s):
+    return re.sub(r"[\u00a0\s]+", " ", str(s)).strip()
+
+def translate_ar(s):
+    s = _clean(s)
+    if s in AR_DEPT: return AR_DEPT[s]
+    m = re.search(r"ويندوز\s*(?:رقم\s*)?(\d+)", s)
+    if m: return f"Windows Line {m.group(1)}"
+    m = re.search(r"(?:اوشيدا|الأوشيدا|أوشيدا|الاوشيدا)\s*البالت\s*رقم\s*(\d+)", s)
+    if m: return f"Ishida Pellet Line {m.group(1)}"
+    if "F.E.N" in s: return "Pellet Line F.E.N"
+    return s
+
+def norm_section(s):
+    t = _clean(s).lower()
+    if t.startswith("pack"): return "Packaging"
+    if t.startswith("proc"): return "Processing"
+    return _clean(s).title()
+
+def parse_general_dept(gd, acct=""):
+    g = _clean(gd); parts = [p.strip() for p in g.split("-")]
+    if len(parts) >= 3 and parts[0].lower() in ("snacks", "pellet"):
+        return parts[0].title(), norm_section(parts[1]), "-".join(parts[2:]).strip()
+    if len(parts) == 2 and parts[0].lower() in ("snacks", "pellet"):
+        return parts[0].title(), norm_section(parts[1]), ""
+    return PLANT_BY_ACCOUNT.get(str(acct).split(".")[0], "Other"), "Other", translate_ar(g)
+
+def _find_header(df0):
+    for i in range(min(len(df0), 30)):
+        cells = [re.sub(r"\s+", " ", str(c)).strip().lower() for c in df0.iloc[i].tolist()]
+        if ("item code" in cells or "description" in cells) and any(x in cells for x in ("net cost", "value", "total actual", "issue cost")):
+            return i
+    return None
+
+def parse_opex_report(f):
+    """Reads every sheet of the ERP report (header row detected automatically) -> normalised DataFrame."""
+    name = getattr(f, "name", "report")
+    if name.lower().endswith(".csv"):
+        sheets = {"CSV": pd.read_csv(f, header=None, dtype=object)}
+    else:
+        if openpyxl is None: raise ImportError("Excel support is missing. Add 'openpyxl' to requirements.txt (or upload a CSV file).")
+        sheets = pd.read_excel(f, sheet_name=None, header=None, dtype=object)
+    frames = []
+    for _, df0 in sheets.items():
+        h = _find_header(df0)
+        if h is None: continue
+        d = df0.iloc[h + 1:].copy()
+        d.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df0.iloc[h].tolist()]
+        frames.append(d.dropna(how="all"))
+    if not frames:
+        raise ValueError("Could not find the report table. Expected columns like Item Code, Description, General Dept, Dept, Net Cost / Value, GL Date.")
+    raw = pd.concat(frames, ignore_index=True)
+    low = {}
+    for c in raw.columns: low.setdefault(c.lower(), c)
+    def col(*names):
+        for n in names:
+            if n in low: return raw[low[n]]
+        return pd.Series([None] * len(raw), index=raw.index)
+    num = lambda s: pd.to_numeric(s, errors="coerce")
+    value = num(col("value")).fillna(num(col("total actual"))).fillna(num(col("net cost")))
+    if value.notna().sum() == 0: raise ValueError("No spend column found (Value / Total Actual / Net Cost).")
+    gl = pd.to_datetime(col("gl date", "date", "posting date"), errors="coerce")
+    period = gl.dt.strftime("%Y-%m")
+    if period.isna().all():   # fall back to Month column (+ year from file name or current year)
+        yr = re.search(r"(20\d\d)", name); yr = int(yr.group(1)) if yr else datetime.now().year
+        mm = col("month").astype(str).str.strip().str[:3].str.lower().map(MONTHS)
+        period = mm.apply(lambda m: f"{yr}-{int(m):02d}" if pd.notna(m) else None)
+        gl = pd.to_datetime(period + "-01", errors="coerce")
+    out = pd.DataFrame(index=raw.index)
+    out["item_code"] = col("item code", "item").astype(str).str.replace(r"\.0$", "", regex=True).str.strip().replace({"None": "", "nan": ""})
+    out["description"] = col("description", "item description").map(lambda x: _clean(x) if x is not None and str(x) != "nan" else "")
+    out["uom"] = col("uom").astype(str).str.strip().replace({"None": "", "nan": ""})
+    gd = col("general dept", "general department").map(_clean)
+    dept = col("dept", "department", "cost center").map(_clean)
+    out["general_dept"], out["dept"] = gd, dept
+    acct = col("category", "account code").astype(str).str.replace(r"\.0$", "", regex=True)
+    out["account_code"] = acct.replace({"None": "", "nan": ""})
+    tm = dept.str.extract(r"^(.*?)\s*\(\(\s*([^()]*?)\s*\)\)\s*$")
+    tag = tm[1].fillna(dept.str.extract(r"(AMER-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)")[0]).fillna("").str.upper().str.strip()
+    out["tag"] = tag
+    out["machine"] = [(m if isinstance(m, str) and m else translate_ar(dp)) for m, dp in zip(tm[0], dept)]
+    parsed = [parse_general_dept(g, a) for g, a in zip(gd, out["account_code"])]
+    out["plant"], out["section"], out["line"] = [p[0] for p in parsed], [p[1] for p in parsed], [p[2] for p in parsed]
+    out["issue_qty"] = num(col("issue qty")); out["return_qty"] = num(col("return qty")).fillna(0)
+    out["issue_cost"] = num(col("issue cost")); out["return_cost"] = num(col("return cost")).fillna(0)
+    out["value"] = value
+    out["gl_date"] = gl.dt.strftime("%Y-%m-%d"); out["period"] = period
+    out["month"] = col("month").astype(str).str.strip().replace({"None": "", "nan": ""})
+    out["quarter"] = col("quarter").astype(str).str.strip().replace({"None": "", "nan": ""})
+    out["account_type"] = col("account type").astype(str).str.strip().replace({"None": "", "nan": ""})
+    out["item_type"] = col("type").astype(str).str.strip().replace({"None": "", "nan": ""})
+    out["budget"] = num(col("budget"))
+    out["source"] = name
+    out = out[out["value"].notna()].reset_index(drop=True)
+    return out
+
+def parse_custom_rules(text):
+    rules = []
+    for line in str(text or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            if k.strip() and v.strip(): rules.append((v.strip(), re.escape(k.strip().lower())))
+    return rules
+
+def classify_part(desc, custom=()):
+    s = str(desc).lower()
+    for cat, pat in list(custom) + CATEGORY_RULES:
+        if re.search(pat, s): return cat
+    return "Other"
+
+def opex_df():
+    """Stored OPEX lines as an analysis DataFrame (adds item group, part category, master-match flag)."""
+    rows = st.session_state.store.get("opex", [])
+    cols = ["item_code", "description", "uom", "general_dept", "dept", "tag", "machine", "plant", "section", "line", "issue_qty", "return_qty",
+            "issue_cost", "return_cost", "value", "gl_date", "period", "month", "quarter", "account_type", "item_type", "budget", "source",
+            "item_group", "part_category", "machine_label", "in_master", "tagged"]
+    if not rows: return pd.DataFrame(columns=cols)
+    d = pd.DataFrame(rows)
+    for c in ["issue_qty", "return_qty", "issue_cost", "return_cost", "value", "budget"]:
+        d[c] = pd.to_numeric(d.get(c), errors="coerce")
+    for c in ["tag", "machine", "plant", "section", "line", "description", "item_code", "general_dept", "dept", "period"]:
+        d[c] = d[c].fillna("").astype(str) if c in d.columns else ""
+    d["gl_date"] = pd.to_datetime(d["gl_date"], errors="coerce")
+    d["item_group"] = d["item_code"].str[:4].map(ITEM_GROUPS).fillna("Other")
+    custom = parse_custom_rules(get_setting("opex_rules", ""))
+    mp = {u: classify_part(u, custom) for u in d["description"].unique()}
+    d["part_category"] = d["description"].map(mp)
+    assets = st.session_state.store.get("assets", [])
+    master = {str(a.get("tag", "")).strip().upper() for a in assets if a.get("tag")}
+    d["tagged"] = d["tag"] != ""
+    d["in_master"] = d["tag"].str.upper().isin(master)
+    d["machine_label"] = np.where(d["tagged"], d["machine"] + " (" + d["tag"] + ")", d["machine"] + " [" + d["line"] + "]")
+    return d
+
+def cur_label():
+    return get_setting("currency", "EGP")
+
+def fmt_cur(x, digits=0):
+    try: return f"{cur_label()} {float(x):,.{digits}f}"
+    except Exception: return str(x)
+
+def machine_table(f):
+    """One row per machine (tag) with spend, lines, share and cumulative share."""
+    if f.empty: return pd.DataFrame()
+    g = f.groupby("machine_label").agg(Machine=("machine", "first"), Tag=("tag", "first"), Plant=("plant", "first"), Section=("section", "first"),
+                                       Line=("line", "first"), Spend=("value", "sum"), Lines=("value", "size"), In_Master=("in_master", "max")).reset_index()
+    g = g.sort_values("Spend", ascending=False).reset_index(drop=True)
+    tot = g["Spend"].sum()
+    g["Share %"] = g["Spend"] / tot * 100 if tot else 0
+    g["Cum %"] = g["Share %"].cumsum()
+    return g
+
+def opex_insights(f):
+    """Returns (list of insight sentences, dict of anomaly tables)."""
+    ins, tabs = [], {}
+    if f.empty: return ins, tabs
+    tot = f["value"].sum(); mt = machine_table(f[f["tagged"]])
+    ins.append(f"Total spare-parts spend **{fmt_cur(tot)}** on **{len(f)}** issue lines across **{f['machine_label'].nunique()}** machines/cost centres.")
+    untag = f.loc[~f["tagged"], "value"].sum()
+    if tot and untag / tot > 0.05:
+        ins.append(f"⚠️ **{untag / tot * 100:.1f}%** of the spend ({fmt_cur(untag)}) was issued to a department with **no machine tag** (general/workshop). Ask storekeepers to issue to a machine so costs can be traced.")
+    if not mt.empty:
+        n80 = int((mt["Cum %"] < 80).sum() + 1)
+        ins.append(f"📊 **{n80} machines** ({n80 / len(mt) * 100:.0f}% of tagged machines) account for 80% of the tagged spend. Biggest: **{mt.iloc[0]['Machine']}** ({mt.iloc[0]['Tag']}) with {fmt_cur(mt.iloc[0]['Spend'])} ({mt.iloc[0]['Share %']:.1f}%).")
+        q1, q3 = mt["Spend"].quantile(0.25), mt["Spend"].quantile(0.75); lim = q3 + 1.5 * (q3 - q1)
+        out = mt[mt["Spend"] > lim][["Machine", "Tag", "Plant", "Line", "Spend", "Lines"]]
+        if not out.empty:
+            tabs["High-spend machines (statistical outliers)"] = out
+            ins.append(f"🚩 **{len(out)} machines** are statistical outliers (spend above {fmt_cur(lim)}).")
+    lim = max(f["value"].quantile(0.95), f["value"].mean() + 3 * f["value"].std(ddof=0)) if len(f) > 5 else f["value"].max()
+    big = f[f["value"] >= lim].sort_values("value", ascending=False)
+    if not big.empty:
+        tabs["Big-ticket issues"] = big[["gl_date", "machine_label", "item_code", "description", "issue_qty", "value"]]
+        ins.append(f"💰 **{len(big)} big-ticket issues** (>= {fmt_cur(lim)}) total **{fmt_cur(big['value'].sum())}** ({big['value'].sum() / tot * 100:.0f}% of spend).")
+    rep = f[f["tagged"] & (f["item_code"] != "")].groupby(["machine_label", "item_code", "description"]).agg(Times=("value", "size"), Qty=("issue_qty", lambda s: -s.sum()), Spend=("value", "sum")).reset_index()
+    rep = rep[rep["Times"] >= 3].sort_values("Spend", ascending=False)
+    if not rep.empty:
+        tabs["Repeat consumption (same part, same machine, 3+ issues)"] = rep
+        ins.append(f"🔁 **{len(rep)} part/machine combinations** were issued 3+ times - possible chronic failures worth a root-cause review.")
+    f2 = f.copy(); f2["uc"] = f2["value"] / f2["issue_qty"].abs().replace(0, np.nan)
+    pv = f2[f2["item_code"] != ""].groupby(["item_code", "description"]).agg(Min=("uc", "min"), Max=("uc", "max"), Lines=("uc", "size")).reset_index()
+    pv = pv[(pv["Lines"] >= 2) & (pv["Min"] > 0) & (pv["Max"] / pv["Min"] > 1.5)]
+    if not pv.empty:
+        pv["Max/Min"] = pv["Max"] / pv["Min"]
+        tabs["Unit-cost variance (same item, different price)"] = pv.sort_values("Max/Min", ascending=False)
+        ins.append(f"🏷️ **{len(pv)} items** show unit-cost differences above 50% between issues (stock valuation / purchase price check).")
+    dup = f[f.duplicated(["item_code", "dept", "general_dept", "gl_date", "issue_qty", "value"], keep=False) & (f["item_code"] != "")]
+    if not dup.empty:
+        tabs["Possible duplicate issue lines"] = dup.sort_values(["item_code", "dept"])[["gl_date", "machine_label", "item_code", "description", "issue_qty", "value"]]
+        ins.append(f"♊ **{len(dup)} lines** look like duplicates (same item, department, date, qty and value) - verify they are not double postings.")
+    z = f[f["value"] <= 0]
+    if not z.empty:
+        tabs["Zero / negative value lines"] = z[["gl_date", "machine_label", "item_code", "description", "issue_qty", "value"]]
+        ins.append(f"🧾 **{len(z)} lines** have zero or negative value (returns or items without a valuation).")
+    nm = f[f["tagged"] & ~f["in_master"]]
+    if not nm.empty:
+        ins.append(f"🛠️ **{nm['tag'].nunique()} machine tags** in the report ({fmt_cur(nm['value'].sum())}) are **not in the Asset Master** - add them so their QR codes, PM and work orders can be linked.")
+    return ins, tabs
+
+def _wo_tag(r):
+    m = re.search(r"(AMER-[A-Z0-9]+(?:-[A-Z0-9]+)+)", str(r.get("asset_name", "")).upper())
+    if m: return m.group(1)
+    meta = r.get("meta")
+    return str(meta.get("tag", "")).upper() if isinstance(meta, dict) else ""
+
+def cmms_link_table(f):
+    """Per machine: OPEX spend vs CMMS work orders (count, breakdowns, recorded WO cost)."""
+    mt = machine_table(f[f["tagged"]])
+    if mt.empty: return mt
+    wo = load_collection("work_orders")
+    if wo.empty or "asset_name" not in wo.columns:
+        mt["WOs"] = 0; mt["Open WOs"] = 0; mt["Breakdowns"] = 0; mt["WO cost"] = 0.0
+    else:
+        wo = wo.copy(); wo["tagx"] = wo.apply(_wo_tag, axis=1)
+        wo["total_cost"] = pd.to_numeric(wo["total_cost"], errors="coerce").fillna(0)
+        wo["bd"] = wo["type"].astype(str).str.contains("Breakdown", case=False, na=False)
+        g = wo[wo["tagx"] != ""].groupby("tagx").agg(WOs=("id", "count"), **{"Open WOs": ("status", lambda s: int((s == "Open").sum()))}, Breakdowns=("bd", "sum"), **{"WO cost": ("total_cost", "sum")})
+        mt = mt.merge(g, how="left", left_on=mt["Tag"].str.upper(), right_index=True).drop(columns=["key_0"], errors="ignore")
+        for c in ["WOs", "Open WOs", "Breakdowns", "WO cost"]: mt[c] = mt[c].fillna(0)
+    mt["Spend per breakdown"] = np.where(mt["Breakdowns"] > 0, mt["Spend"] / mt["Breakdowns"].replace(0, np.nan), np.nan)
+    return mt
+
+def opex_excel(f, ins, tabs, cmms):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        pd.DataFrame({"Insight": [re.sub(r"[*]", "", i) for i in ins]}).to_excel(xw, sheet_name="Insights", index=False)
+        f.groupby(["plant", "section", "line"]).agg(Spend=("value", "sum"), Lines=("value", "size"), Machines=("machine_label", "nunique")).reset_index().sort_values("Spend", ascending=False).to_excel(xw, sheet_name="By Line", index=False)
+        mt = machine_table(f)
+        if not mt.empty: mt.drop(columns=["machine_label"]).to_excel(xw, sheet_name="By Machine", index=False)
+        f.groupby("part_category").agg(Spend=("value", "sum"), Lines=("value", "size")).reset_index().sort_values("Spend", ascending=False).to_excel(xw, sheet_name="By Part Category", index=False)
+        f.groupby("item_group").agg(Spend=("value", "sum"), Lines=("value", "size")).reset_index().sort_values("Spend", ascending=False).to_excel(xw, sheet_name="By Item Group", index=False)
+        f.groupby(["item_code", "description"]).agg(Qty=("issue_qty", lambda s: -s.sum()), Spend=("value", "sum"), Machines=("machine_label", "nunique")).reset_index().sort_values("Spend", ascending=False).head(500).to_excel(xw, sheet_name="Top Items", index=False)
+        if f["period"].nunique() > 1: f.groupby("period").agg(Spend=("value", "sum"), Lines=("value", "size")).reset_index().to_excel(xw, sheet_name="By Month", index=False)
+        if cmms is not None and not cmms.empty: cmms.drop(columns=["machine_label"], errors="ignore").to_excel(xw, sheet_name="OPEX vs CMMS", index=False)
+        for i, (k, v) in enumerate(tabs.items()):
+            v.to_excel(xw, sheet_name=(re.sub(r"[\\/*?:\[\]]", "-", k.split(" (")[0])[:31] or f"Anomaly{i}"), index=False)
+        un = f[f["tagged"] & ~f["in_master"]].groupby(["tag", "machine", "plant", "section", "line"]).agg(Spend=("value", "sum")).reset_index()
+        if not un.empty: un.to_excel(xw, sheet_name="Not in Asset Master", index=False)
+        for ws in xw.book.worksheets:
+            ws.freeze_panes = "A2"
+            for col_cells in ws.columns:
+                w = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells[:60])
+                ws.column_dimensions[col_cells[0].column_letter].width = min(max(w + 2, 10), 60)
+    return buf.getvalue()
+
+def opex_pdf(f, ins):
+    pdf = FPDF(); pdf.add_page()
+    pdf.set_font("Arial", "B", 16); pdf.cell(0, 10, "Americana Foods - EP Plants", 0, 1)
+    pdf.set_font("Arial", "B", 13); pdf.cell(0, 8, _lat("Spare Parts Spend (OPEX) Analysis"), 0, 1)
+    pdf.set_font("Arial", "I", 9); pdf.cell(0, 6, _lat(f"Periods: {', '.join(sorted(f['period'].unique()))}  |  Generated {datetime.now():%Y-%m-%d %H:%M}"), 0, 1)
+    pdf.line(10, pdf.get_y() + 1, 200, pdf.get_y() + 1); pdf.ln(4)
+    pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, "Key findings", 0, 1); pdf.set_font("Arial", "", 9)
+    for i in ins:
+        t = re.sub(r"[*]", "", i).encode("ascii", "ignore").decode().strip(" ")
+        pdf.multi_cell(0, 5, _lat("- " + t)); pdf.ln(1)
+    def table(title, df, widths, heads):
+        pdf.ln(3); pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, title, 0, 1)
+        pdf.set_fill_color(220, 228, 236); pdf.set_font("Arial", "B", 8)
+        for w, h in zip(widths, heads): pdf.cell(w, 6, h, 1, 0, "C", True)
+        pdf.ln(); pdf.set_font("Arial", "", 8)
+        for row in df.itertuples(index=False):
+            for w, v in zip(widths, row):
+                txt = f"{v:,.0f}" if isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool) else _lat(str(v))[:int(w / 1.9)]
+                pdf.cell(w, 5.5, txt, 1, 0, "R" if isinstance(v, (int, float, np.floating, np.integer)) else "L")
+            pdf.ln()
+    pl = f.groupby(["plant", "section", "line"]).agg(S=("value", "sum"), L=("value", "size")).reset_index().sort_values("S", ascending=False).head(20)
+    table("Spend by plant / section / line", pl, [30, 35, 55, 35, 25], ["Plant", "Section", "Line", f"Spend ({cur_label()})", "Lines"])
+    mt = machine_table(f[f["tagged"]]).head(15)
+    if not mt.empty:
+        table("Top 15 machines", mt[["Machine", "Tag", "Line", "Spend", "Share %"]].assign(**{"Share %": mt["Share %"].round(1)}), [45, 55, 30, 30, 25], ["Machine", "Tag", "Line", f"Spend ({cur_label()})", "Share %"])
+    pc = f.groupby("part_category")["value"].sum().sort_values(ascending=False).reset_index()
+    table("Spend by part category", pc, [110, 50], ["Category", f"Spend ({cur_label()})"])
+    return pdf.output(dest="S").encode("latin-1", "replace")
+
+
+# =====================================================================
 # --- 9. MIGO AI / NLP ENGINE ---
 # Hybrid NLP pipeline (100% local, no API needed):
 #   1. Rule layer        -> high-precision regex for KPI words (MTTR, OEE, ...)
@@ -1648,6 +1964,12 @@ INTENT_EXAMPLES = {
                            "asset performance table", "analyze machines", "reliability report"],
     "backlog": ["backlog age", "how old are open orders", "oldest open work order", "aging of open orders",
                 "overdue work orders"],
+    "spend_summary": ["how much did we spend on spare parts", "opex total", "spare parts spending summary", "spending analysis",
+                      "total opex this month", "spare parts cost by plant", "how much did spare parts cost"],
+    "spend_machines": ["top machines by spare parts spend", "which machines consume the most spare parts", "highest opex machines",
+                       "spare parts cost of machine", "how much spare parts did this machine use"],
+    "spend_category": ["spare parts spend by category", "what type of parts cost the most", "opex by item group",
+                       "which part category is most expensive", "spend by part type"],
     "app_howto": ["how do i create a work order", "how to add a spare part", "how to report a breakdown",
                   "how to save my data", "how do i upload assets", "how to generate qr code",
                   "how to resume my work", "how to create a pm plan", "how to close a job", "how to export pdf"],
@@ -1670,6 +1992,7 @@ FAQ = [
     ("how to forecast opex budget", "Open **💼 Maintenance Manager** (managers only), set actuals, inflation and risk allowance to see the OPEX forecast waterfall."),
     ("how to upload manuals documents diagrams for a machine", "Go to **🛠️ Asset Master Data → 📚 Documents**, pick the machine (or all machines with the same name), choose the type (Manual, Diagram…), select the files and click **Save document(s)**."),
     ("how do technicians see work orders and manuals by scanning qr code", "Set a PIN in **🛠️ Asset Master Data → 📡 Technician Access** and publish. Technicians scan the machine QR, open the **🔧 Technician Info** tab and enter the PIN to see open work orders, PM plans, history, spare parts and documents."),
+    ("how to upload opex spend report spare parts analysis", "Go to **💰 OPEX & Spend Analysis → Upload Report** (managers), choose the monthly spare-parts issue report (.xlsx) and click **Import report**. Then use the Overview, Machines, Parts, Insights and OPEX vs CMMS tabs, or ask me, e.g. *top machines by spare parts spend*."),
     ("how to review my previous chats with migo", "In **🤖 Migo Chatbot**, switch to **📜 Chat History** to search, review, continue, download or delete past conversations."),
 ]
 
@@ -1710,6 +2033,11 @@ FOLLOW = {
     "performance_report": ["Chart cost by asset", "Which machines are at highest risk?"],
     "backlog": ["Show open work orders", "Technician performance"],
 }
+FOLLOW.update({
+    "spend_summary": ["Top machines by spare parts spend", "Spare parts spend by category", "Give me an executive summary"],
+    "spend_machines": ["Spare parts spend by category", "Which machines are at highest risk?", "Spare parts spending summary"],
+    "spend_category": ["Top machines by spare parts spend", "Spare parts spending summary"],
+})
 DEFAULT_FOLLOW = ["Give me an executive summary", "Show open work orders", "List low stock items"]
 
 # Regex rules: (pattern, intent) -> checked before the ML classifier (first match wins)
@@ -1718,6 +2046,9 @@ RULES = [
     (r"\b(thanks|thank you|thx)\b", "thanks"),
     (r"\bhow (do|can|to|should|could)\b.*\b(create|add|close|report|upload|import|save|resume|generate|download|change|set|export|view|find|review|print)\b", "app_howto"),
     (r"\bhow to\b", "app_howto"),
+    (r"(opex|spare ?parts?|parts?)\b.*\b(categor|by type|by group|kind of)|\b(categor\w*|item group)\b.*\b(opex|spare ?parts?|spend)", "spend_category"),
+    (r"\bopex\b.*\b(machine|asset|equipment)|\b(machines?|assets?|equipment)\b.*\b(opex|spare ?parts? (spend|cost|consum))|spare ?parts? (spend|cost|consum)\w* (of|for|on) ", "spend_machines"),
+    (r"\bopex\b|spare ?parts? (spend|spending|cost|costs|expense|expenses|consumption|consumed)|spend(ing)? on spare", "spend_summary"),
     (r"\bmttr\b", "mttr"),
     (r"\bmtbf\b", "mtbf"),
     (r"\boee\b|availability|uptime|downtime", "availability"),
@@ -1788,7 +2119,7 @@ def migo_load():
     wo["repair_hrs"] = (wo["closed_date"] - wo["created_at"]).dt.total_seconds() / 3600
     inv["quantity"] = pd.to_numeric(inv["quantity"], errors="coerce").fillna(0)
     inv["cost"] = pd.to_numeric(inv["cost"], errors="coerce").fillna(0)
-    return {"wo": wo, "inv": inv, "assets": assets, "plans": plans}
+    return {"wo": wo, "inv": inv, "assets": assets, "plans": plans, "opex": opex_df()}
 
 
 def migo_kpis(wo):
@@ -1837,7 +2168,7 @@ def extract_topn(ql, default):
     return (int(m.group(1)), True) if m else (default, False)
 
 
-def build_candidates(assets, wo):
+def build_candidates(assets, wo, opex=None):
     cand = {}
     bad = ("nan", "n/a", "unknown", "none", "")
     if not assets.empty:
@@ -1849,6 +2180,10 @@ def build_candidates(assets, wo):
         for a in wo["asset_name"].dropna().astype(str).unique():
             if a.strip().lower() not in bad:
                 cand.setdefault(a.strip().lower(), (a, ""))
+    if opex is not None and not opex.empty:
+        for tg, mn in opex.loc[opex["tag"] != "", ["tag", "machine"]].drop_duplicates().itertuples(index=False):
+            for k in (str(mn), str(tg)):
+                cand.setdefault(k.strip().lower(), (str(mn), str(tg)))
     return cand
 
 
@@ -1887,7 +2222,8 @@ def find_group_filter(ql, assets):
         if col in assets.columns:
             for v in assets[col].dropna().astype(str).unique():
                 vl = v.lower().strip()
-                if vl and vl not in ("nan", "general", "unknown") and re.search(r"(?<![a-z0-9])" + re.escape(vl) + r"(?![a-z0-9])", ql):
+                variants = {vl, norm_section(v).lower()} if col == "section" else {vl}   # "Packging" (typo in master) also matches "packaging"
+                if vl and vl not in ("nan", "general", "unknown") and any(re.search(r"(?<![a-z0-9])" + re.escape(x) + r"(?![a-z0-9])", ql) for x in variants):
                     out[col] = v; break
     return out
 
@@ -2271,7 +2607,62 @@ def h_howto(ctx):
     if score < 0.15: return R("I couldn't find a matching guide. Try *how do I create a work order?*, *how do I import assets?* or *how do I save my data?*")
     return R(FAQ[idx][1])
 
+# ---------- OPEX intents (spare-parts spend) ----------
+def _opex_scope(ctx):
+    d = ctx.get("opex")
+    if d is None or d.empty: return d
+    if ctx["time"]:
+        s, e, _ = ctx["time"]; d = d[(d["gl_date"] >= s) & (d["gl_date"] <= e)]
+    g = ctx["group"]
+    if g.get("site"): d = d[d["plant"].str.lower() == g["site"].lower()]
+    if g.get("section"): d = d[d["section"].str.lower() == norm_section(g["section"]).lower()]
+    if g.get("line"): d = d[d["line"].str.lower() == g["line"].lower()]
+    if ctx["assets_found"]:
+        tg = re.findall(r"AMER-[A-Z0-9]+(?:-[A-Z0-9]+)+", ctx["ql"].upper())
+        if tg: d = d[d["tag"].isin(tg)]
+        else:
+            names = {a["name"].lower() for a in ctx["assets_found"] if a["name"]}; tags = {a["tag"].upper() for a in ctx["assets_found"] if a["tag"]}
+            d = d[d["machine"].str.lower().isin(names) | d["tag"].isin(tags)]
+    return d
+
+_NO_OPEX = "No OPEX (spare-parts spend) report is loaded yet. Upload it in **💰 OPEX & Spend Analysis → Upload Report**."
+
+def h_spend_summary(ctx):
+    d = _opex_scope(ctx)
+    if ctx.get("opex") is None or ctx["opex"].empty: return R(_NO_OPEX)
+    if d.empty: return R("No spare-parts spend found" + scope_label(ctx) + ".")
+    tot = d["value"].sum(); mt = machine_table(d[d["tagged"]])
+    pl = d.groupby("plant")["value"].sum().sort_values(ascending=False)
+    tbl = pl.reset_index(); tbl.columns = ["Plant", f"Spend ({cur_label()})"]
+    top = f" Top machine: **{mt.iloc[0]['Machine']}** ({mt.iloc[0]['Tag']}) with {fmt_cur(mt.iloc[0]['Spend'])}." if not mt.empty else ""
+    return R(f"Spare-parts spend{scope_label(ctx)}: **{fmt_cur(tot)}** on **{len(d)}** issue lines across **{d['machine_label'].nunique()}** machines/cost centres.{top} Periods: {', '.join(sorted(d['period'].unique()))}.",
+             tbl, chart_spec("pie", pl.index, pl.values, "Spare-parts spend by plant") if charts_ok(ctx) else None)
+
+def h_spend_machines(ctx):
+    d = _opex_scope(ctx)
+    if ctx.get("opex") is None or ctx["opex"].empty: return R(_NO_OPEX)
+    if d.empty: return R("No spare-parts spend found" + scope_label(ctx) + ".")
+    if ctx["assets_found"]:
+        parts = d.groupby(["item_code", "description"]).agg(Qty=("issue_qty", lambda s: -s.sum()), Spend=("value", "sum")).reset_index().sort_values("Spend", ascending=False).head(15)
+        return R(f"Spare-parts spend{scope_label(ctx)}: **{fmt_cur(d['value'].sum())}** on **{len(d)}** issue lines ({d['machine_label'].nunique()} machine(s)). Biggest parts below.", parts.rename(columns={"item_code": "Item code", "description": "Description"}))
+    n, _ = ctx["topn"]; mt = machine_table(d[d["tagged"]]).head(n)
+    if mt.empty: return R("No machine-tagged spend found.")
+    tbl = mt[["Machine", "Tag", "Plant", "Line", "Spend", "Share %"]]
+    return R(f"Top **{len(mt)}** machines by spare-parts spend{scope_label(ctx)}: **{mt.iloc[0]['Machine']}** leads with **{fmt_cur(mt.iloc[0]['Spend'])}** ({mt.iloc[0]['Share %']:.1f}%).",
+             tbl, chart_spec("barh", mt["Machine"] + " " + mt["Tag"].str[-7:], mt["Spend"], "Top machines by spare-parts spend") if charts_ok(ctx) else None)
+
+def h_spend_category(ctx):
+    d = _opex_scope(ctx)
+    if ctx.get("opex") is None or ctx["opex"].empty: return R(_NO_OPEX)
+    if d.empty: return R("No spare-parts spend found" + scope_label(ctx) + ".")
+    g = d.groupby("part_category")["value"].sum().sort_values(ascending=False)
+    tbl = g.reset_index(); tbl.columns = ["Part category", f"Spend ({cur_label()})"]; tbl["Share %"] = (g.values / g.sum() * 100).round(1)
+    return R(f"Biggest spare-parts category{scope_label(ctx)}: **{g.index[0]}** with **{fmt_cur(g.iloc[0])}** ({g.iloc[0] / g.sum() * 100:.0f}% of spend).",
+             tbl, chart_spec("barh", g.index, g.values, "Spend by part category") if charts_ok(ctx) else None)
+
+
 HANDLERS = {
+    "spend_summary": h_spend_summary, "spend_machines": h_spend_machines, "spend_category": h_spend_category,
     "greeting": h_greeting, "thanks": h_thanks, "help": h_help, "total_spend": h_total_spend, "cost_by_asset": h_cost_by_asset,
     "cost_trend": h_cost_trend, "forecast": h_forecast, "open_orders": h_open_orders, "closed_orders": h_closed_orders,
     "wo_summary": h_wo_summary, "breakdown_summary": h_breakdown_summary, "bad_actors": h_bad_actors, "mttr": h_mttr,
@@ -2322,7 +2713,7 @@ def migo_llm(q, history, data, model):
 def migo_process(q, prev, data, history, model):
     intent_m, faq_m = get_migo_models()
     ql = q.lower().strip()
-    cand = build_candidates(data["assets"], data["wo"])
+    cand = build_candidates(data["assets"], data["wo"], data.get("opex"))
     found = find_assets(ql, cand)
     if not found and prev.get("assets") and re.search(r"\b(it|its|this machine|that machine|this asset|same machine|same asset|them)\b", ql):
         found = prev["assets"]
@@ -2353,7 +2744,7 @@ def migo_process(q, prev, data, history, model):
 
     ctx = {"q": q, "ql": ql, "wo": data["wo"], "inv": data["inv"], "assets": data["assets"], "plans": data["plans"],
            "assets_found": found, "time": time_r, "topn": (topn, topn_explicit), "group": group,
-           "chart": want_chart, "table_only": table_only, "faq_m": faq_m}
+           "chart": want_chart, "table_only": table_only, "faq_m": faq_m, "opex": data.get("opex")}
     if intent is None:
         key = get_migo_api_key()
         if key:
@@ -2956,6 +3347,245 @@ elif menu == "🛠️ Asset Master Data":
             i1, i2, i3, i4 = st.columns(4)
             i1.metric("Last published", info["time"]); i2.metric("Assets", info["assets"]); i3.metric("Work orders", info["wos"]); i4.metric("Documents", info["docs"])
         st.caption("⚠️ Published data lives on the app server. If the app restarts or sleeps it is cleared - load your data file and it is published again automatically (when a PIN is set).")
+
+# --- MODULE 8: OPEX & SPEND ANALYSIS ---
+elif menu == "💰 OPEX & Spend Analysis":
+    st.title("💰 OPEX & Spend Analysis")
+    st.caption("Upload the monthly spare-parts issue report (ERP) to analyse spending per plant, line, machine, part category and compare it with the CMMS.")
+    cur = cur_label()
+    d_all = opex_df()
+
+    @st.cache_data(show_spinner="Reading report…")
+    def _parse_cached(raw_bytes, fname):
+        bio = io.BytesIO(raw_bytes); bio.name = fname
+        return parse_opex_report(bio)
+
+    # ---------------- global filters ----------------
+    f = d_all
+    if not d_all.empty:
+        with st.expander("🔎 Filters (apply to all tabs below)", expanded=False):
+            fc = st.columns(5)
+            sel_p = fc[0].multiselect("Period", sorted(d_all["period"].unique()), key="ox_f_period")
+            sel_pl = fc[1].multiselect("Plant", sorted(d_all["plant"].unique()), key="ox_f_plant")
+            sel_se = fc[2].multiselect("Section", sorted(d_all["section"].unique()), key="ox_f_section")
+            sel_li = fc[3].multiselect("Line", sorted(d_all["line"].unique()), key="ox_f_line")
+            sel_ig = fc[4].multiselect("Item group", sorted(d_all["item_group"].unique()), key="ox_f_group")
+            for col_, sel_ in [("period", sel_p), ("plant", sel_pl), ("section", sel_se), ("line", sel_li), ("item_group", sel_ig)]:
+                if sel_: f = f[f[col_].isin(sel_)]
+        st.markdown(f"**{len(f):,} lines · {fmt_cur(f['value'].sum())}**" + ("" if len(f) == len(d_all) else f"  (filtered from {len(d_all):,} lines)"))
+
+    t_up, t_ov, t_mc, t_pt, t_in, t_cm, t_ex = st.tabs(["📤 Upload Report", "📊 Overview", "🏭 Machines", "🔩 Parts & Items", "🚩 Insights", "🔗 OPEX vs CMMS", "📥 Export"])
+
+    # ---------------- upload ----------------
+    with t_up:
+        st.subheader("Upload spend report")
+        u1, u2 = st.columns([1, 2])
+        new_cur = u1.text_input("Currency label", value=cur, help="Shown next to every amount in this module (the report values are used as-is).")
+        if new_cur.strip() and new_cur.strip() != cur: set_setting("currency", new_cur.strip()); st.rerun()
+        mode = u2.radio("If the file contains months that are already loaded", ["Replace those months (recommended)", "Add to the existing data"], horizontal=True)
+        up = st.file_uploader("Spare-parts issue report (.xlsx / .csv) - all sheets are read, the header row is detected automatically", type=["xlsx", "xls", "csv"], key="opex_upload")
+        if up is not None:
+            try:
+                new = _parse_cached(up.getvalue(), up.name)
+                st.success(f"Report understood: **{len(new):,} lines**, period(s) **{', '.join(sorted(new['period'].dropna().unique()))}**, total **{fmt_cur(new['value'].sum())}**.")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Lines", f"{len(new):,}"); m2.metric("Machines (tags)", new.loc[new["tag"] != "", "tag"].nunique())
+                m3.metric("Tagged spend", f"{new.loc[new['tag'] != '', 'value'].sum() / max(new['value'].sum(), 1e-9) * 100:.1f}%")
+                master = {str(a.get("tag", "")).strip().upper() for a in st.session_state.store.get("assets", []) if a.get("tag")}
+                nm = new[(new["tag"] != "") & ~new["tag"].isin(master)]
+                m4.metric("Tags not in Asset Master", nm["tag"].nunique())
+                st.dataframe(one_based(new.head(8)[["gl_date", "plant", "section", "line", "machine", "tag", "item_code", "description", "issue_qty", "value"]]), use_container_width=True)
+                loaded = {r.get("period") for r in st.session_state.store.get("opex", [])}
+                overlap = sorted(loaded & set(new["period"].dropna().unique()))
+                if overlap and mode.startswith("Replace"): st.info(f"Months already loaded will be replaced: {', '.join(overlap)}")
+                elif overlap: st.warning(f"Months already loaded: {', '.join(overlap)}. 'Add' will duplicate their lines.")
+                if st.button("✅ Import report", key="opex_import"):
+                    store = st.session_state.store.setdefault("opex", [])
+                    if mode.startswith("Replace"):
+                        pers = set(new["period"].dropna().unique()); store[:] = [r for r in store if r.get("period") not in pers]
+                    recs = json.loads(json.dumps(new.where(pd.notna(new), None).to_dict("records"), default=_json_default))
+                    store.extend(recs); st.session_state.dirty += 1
+                    log_notification(f"💰 OPEX report imported: {len(recs)} lines", toast=False)
+                    st.success("Imported. Open the other tabs for the analysis - and remember to 📥 Save Data to File."); time.sleep(1); st.rerun()
+                if not nm.empty:
+                    um = nm.groupby(["tag", "machine", "plant", "section", "line"]).agg(Spend=("value", "sum")).reset_index().sort_values("Spend", ascending=False)
+                    with st.expander(f"🛠️ {len(um)} machines in this report are not in the Asset Master ({fmt_cur(um['Spend'].sum())})"):
+                        st.dataframe(one_based(um), use_container_width=True)
+                        if st.button("➕ Add these machines to the Asset Master", key="opex_add_assets"):
+                            for r in um.itertuples():
+                                save_document("assets", {"name": r.machine, "tag": r.tag, "factory": "EP", "site": r.plant, "section": r.section, "line": r.line, "created_at": str(datetime.now())}, notify=False)
+                            log_notification(f"🛠️ {len(um)} assets added from the OPEX report", toast=False)
+                            st.success(f"Added {len(um)} machines."); time.sleep(1); st.rerun()
+            except Exception as e:
+                st.error(f"Could not read the report: {e}")
+        if not d_all.empty:
+            st.divider(); st.markdown("#### Loaded data")
+            lp = d_all.groupby("period").agg(Lines=("value", "size"), Spend=("value", "sum"), Machines=("machine_label", "nunique"), Source=("source", "first")).reset_index()
+            st.dataframe(one_based(lp), use_container_width=True)
+            dc1, dc2 = st.columns([2, 1])
+            del_p = dc1.selectbox("Remove a month", ["-"] + list(lp["period"]), key="opex_del_period")
+            if dc2.button("🗑️ Remove month", key="opex_del_btn") and del_p != "-":
+                st.session_state.store["opex"] = [r for r in st.session_state.store["opex"] if r.get("period") != del_p]; st.session_state.dirty += 1; st.rerun()
+            with st.expander("⚙️ Part-category keywords (optional)"):
+                st.caption("Add your own rules, one per line: `keyword = Category`. They are checked before the built-in Arabic/English rules. Example: `رولمان = Bearings & Housings`")
+                rules_txt = st.text_area("Custom rules", value=get_setting("opex_rules", ""), height=110, key="opex_rules_box")
+                if st.button("Save rules", key="opex_rules_save"): set_setting("opex_rules", rules_txt); st.rerun()
+
+    if d_all.empty:
+        for t in (t_ov, t_mc, t_pt, t_in, t_cm, t_ex):
+            with t: st.info("Upload and import a spend report in the **📤 Upload Report** tab first.")
+    elif f.empty:
+        for t in (t_ov, t_mc, t_pt, t_in, t_cm, t_ex):
+            with t: st.warning("No data for the selected filters.")
+    else:
+        mt_all = machine_table(f)
+        mt_tag = machine_table(f[f["tagged"]])
+        # ---------------- overview ----------------
+        with t_ov:
+            tot = f["value"].sum()
+            k = st.columns(6)
+            k[0].metric("💰 Total spend", fmt_cur(tot)); k[1].metric("🧾 Issue lines", f"{len(f):,}")
+            k[2].metric("⚙️ Machines with spend", f.loc[f["tagged"], "machine_label"].nunique())
+            k[3].metric("📐 Avg per machine", fmt_cur(mt_tag["Spend"].mean() if not mt_tag.empty else 0))
+            k[4].metric("🏆 Top machine", (mt_tag.iloc[0]["Machine"] if not mt_tag.empty else "-"), delta=fmt_cur(mt_tag.iloc[0]["Spend"]) if not mt_tag.empty else None, delta_color="off")
+            k[5].metric("🏷️ Spend with machine tag", f"{f.loc[f['tagged'], 'value'].sum() / tot * 100:.1f}%")
+            c1, c2 = st.columns(2)
+            by_pl = f.groupby("plant")["value"].sum().reset_index()
+            c1.plotly_chart(px.pie(by_pl, names="plant", values="value", hole=0.5, title="Spend by plant"), use_container_width=True)
+            by_sec = f.groupby(["plant", "section"])["value"].sum().reset_index()
+            c2.plotly_chart(px.bar(by_sec, x="plant", y="value", color="section", barmode="stack", title="Spend by plant & section", labels={"value": f"Spend ({cur})"}), use_container_width=True)
+            by_line = f.groupby(["plant", "section", "line"])["value"].sum().reset_index().sort_values("value", ascending=False).head(15)
+            by_line["Line"] = by_line["plant"] + " · " + by_line["section"] + " · " + by_line["line"]
+            c3, c4 = st.columns(2)
+            c3.plotly_chart(px.bar(by_line.iloc[::-1], x="value", y="Line", orientation="h", title="Top 15 lines by spend", labels={"value": f"Spend ({cur})"}, color="value", color_continuous_scale="Blues"), use_container_width=True)
+            by_ig = f.groupby("item_group")["value"].sum().reset_index()
+            c4.plotly_chart(px.pie(by_ig, names="item_group", values="value", hole=0.5, title="By ERP item group (Electrical / Mechanical / Pneumatic / Consumables)"), use_container_width=True)
+            by_pc = f.groupby("part_category")["value"].sum().sort_values().reset_index()
+            st.plotly_chart(px.bar(by_pc, x="value", y="part_category", orientation="h", title="Spend by part category (auto-classified)", labels={"value": f"Spend ({cur})", "part_category": ""}, color="value", color_continuous_scale="Teal"), use_container_width=True)
+            if f["period"].nunique() > 1:
+                tr = f.groupby("period")["value"].sum().reset_index()
+                tr["MoM %"] = tr["value"].pct_change() * 100
+                st.plotly_chart(px.bar(tr, x="period", y="value", text_auto=".3s", title="Monthly spend trend", labels={"value": f"Spend ({cur})"}), use_container_width=True)
+                st.dataframe(one_based(tr.rename(columns={"period": "Period", "value": "Spend"})), use_container_width=True)
+            else:
+                st.caption("Upload more months to see trends and month-over-month changes.")
+            st.markdown("#### 🎯 Budget vs Actual")
+            n_per = max(f["period"].nunique(), 1)
+            rep_bud = f.groupby("plant")["budget"].sum(min_count=1) if f["budget"].notna().any() else None
+            plants = sorted(f["plant"].unique()); bud = get_setting("opex_budget", {}) or {}
+            if rep_bud is None:
+                with st.expander("Set monthly budget per plant", expanded=not bud):
+                    bc = st.columns(max(len(plants), 1)); newb = {}
+                    for i, p_ in enumerate(plants): newb[p_] = bc[i].number_input(f"{p_} - monthly budget ({cur})", min_value=0.0, value=float(bud.get(p_, 0.0)), step=10000.0, key=f"bud_{p_}")
+                    if st.button("Save budgets", key="bud_save"): set_setting("opex_budget", newb); st.rerun()
+            rows = []
+            for p_ in plants:
+                actual = f.loc[f["plant"] == p_, "value"].sum()
+                b = float(rep_bud.get(p_, 0)) if rep_bud is not None else float(bud.get(p_, 0)) * n_per
+                if b > 0: rows.append({"Plant": p_, "Budget": b, "Actual": actual, "Variance": actual - b, "Variance %": (actual - b) / b * 100, "Status": "🔴 Over" if actual > b else "🟢 Within"})
+            if rows:
+                bt = pd.DataFrame(rows)
+                st.plotly_chart(go.Figure([go.Bar(name="Budget", x=bt["Plant"], y=bt["Budget"]), go.Bar(name="Actual", x=bt["Plant"], y=bt["Actual"])]).update_layout(barmode="group", title=f"Budget vs actual ({n_per} period(s))"), use_container_width=True)
+                st.dataframe(one_based(bt), use_container_width=True)
+            else:
+                st.caption("The report has no Budget values. Enter monthly budgets above to see variances.")
+
+        # ---------------- machines ----------------
+        with t_mc:
+            n_top = st.slider("Show top N machines", 5, 100, 20, key="ox_topn")
+            show = mt_all.head(n_top).copy(); show["Spend"] = show["Spend"].round(0); show["Share %"] = show["Share %"].round(1); show["Cum %"] = show["Cum %"].round(1)
+            st.dataframe(one_based(show.drop(columns=["machine_label"]).rename(columns={"In_Master": "In Asset Master"})), use_container_width=True)
+            par = mt_all.head(n_top)
+            figp = go.Figure()
+            figp.add_bar(x=par["Machine"], y=par["Spend"], name="Spend", marker_color="#0a6ed1")
+            figp.add_scatter(x=par["Machine"], y=par["Cum %"], name="Cumulative %", yaxis="y2", mode="lines+markers", line=dict(color="#d63031"))
+            figp.update_layout(title="Pareto - top machines", yaxis=dict(title=f"Spend ({cur})"), yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 105]), legend=dict(orientation="h"))
+            st.plotly_chart(figp, use_container_width=True)
+            tm = f[f["value"] > 0].copy(); tm["Machine"] = tm["machine_label"]
+            st.plotly_chart(px.treemap(tm, path=["plant", "section", "line", "Machine"], values="value", color="value", color_continuous_scale="Blues", title="Spend map: Plant › Section › Line › Machine").update_layout(height=560), use_container_width=True)
+            st.divider(); st.markdown("#### 🔍 Machine drill-down")
+            choices = list(mt_all["machine_label"]); pick = st.selectbox("Machine", choices, key="ox_machine_pick")
+            fm_ = f[f["machine_label"] == pick]
+            r0 = mt_all[mt_all["machine_label"] == pick].iloc[0]
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("Spend", fmt_cur(fm_["value"].sum())); q2.metric("Issue lines", len(fm_)); q3.metric("Share of total", f"{r0['Share %']:.1f}%"); q4.metric("Rank", f"#{int(mt_all.index[mt_all['machine_label'] == pick][0]) + 1}")
+            dc1, dc2 = st.columns(2)
+            pcs = fm_.groupby("part_category")["value"].sum().reset_index()
+            dc1.plotly_chart(px.pie(pcs, names="part_category", values="value", hole=0.5, title="By part category"), use_container_width=True)
+            if fm_["period"].nunique() > 1: dc2.plotly_chart(px.bar(fm_.groupby("period")["value"].sum().reset_index(), x="period", y="value", title="By month"), use_container_width=True)
+            else: dc2.dataframe(one_based(pcs.rename(columns={"part_category": "Category", "value": "Spend"}).sort_values("Spend", ascending=False)), use_container_width=True)
+            st.dataframe(one_based(fm_.sort_values("value", ascending=False)[["gl_date", "item_code", "description", "uom", "issue_qty", "value"]].rename(columns={"gl_date": "Date", "item_code": "Item code", "description": "Description", "uom": "UOM", "issue_qty": "Qty issued", "value": "Value"})), use_container_width=True)
+
+        # ---------------- parts ----------------
+        with t_pt:
+            pc1, pc2 = st.columns(2)
+            cat = f.groupby("part_category").agg(Spend=("value", "sum"), Lines=("value", "size"), Items=("item_code", "nunique")).reset_index().sort_values("Spend", ascending=False)
+            cat["Share %"] = (cat["Spend"] / cat["Spend"].sum() * 100).round(1)
+            pc1.markdown("**By part category**"); pc1.dataframe(one_based(cat.rename(columns={"part_category": "Category"})), use_container_width=True)
+            ig = f.groupby("item_group").agg(Spend=("value", "sum"), Lines=("value", "size"), Items=("item_code", "nunique")).reset_index().sort_values("Spend", ascending=False)
+            ig["Share %"] = (ig["Spend"] / ig["Spend"].sum() * 100).round(1)
+            pc2.markdown("**By ERP item group**"); pc2.dataframe(one_based(ig.rename(columns={"item_group": "Item group"})), use_container_width=True)
+            oth = f[f["part_category"] == "Other"].groupby("description")["value"].sum().sort_values(ascending=False).head(10)
+            if not oth.empty and oth.sum() / f["value"].sum() > 0.03:
+                with st.expander(f"❔ Unclassified items ({fmt_cur(f.loc[f['part_category'] == 'Other', 'value'].sum())}) - top 10 (add keywords in Upload Report › Part-category keywords)"):
+                    st.dataframe(one_based(oth.reset_index().rename(columns={"description": "Description", "value": "Spend"})), use_container_width=True)
+            st.markdown("**Top items by spend**")
+            ti = f[f["item_code"] != ""].groupby(["item_code", "description", "part_category"]).agg(Qty=("issue_qty", lambda s: -s.sum()), Spend=("value", "sum"), Machines=("machine_label", "nunique"), Issues=("value", "size")).reset_index().sort_values("Spend", ascending=False)
+            st.dataframe(one_based(ti.head(30).rename(columns={"item_code": "Item code", "description": "Description", "part_category": "Category"})), use_container_width=True)
+            st.markdown("**🔎 Search items**")
+            qtxt = st.text_input("Search description or item code (Arabic or English)", key="ox_item_q").strip().lower()
+            if qtxt:
+                hit = f[f["description"].str.lower().str.contains(qtxt, regex=False) | f["item_code"].str.contains(qtxt, regex=False)]
+                st.caption(f"{len(hit)} lines · {fmt_cur(hit['value'].sum())}")
+                st.dataframe(one_based(hit.sort_values("value", ascending=False)[["gl_date", "machine_label", "item_code", "description", "issue_qty", "value"]].head(200)), use_container_width=True)
+
+        # ---------------- insights ----------------
+        ins, anomalies = opex_insights(f)
+        with t_in:
+            st.subheader("🧠 Key findings")
+            for i in ins: st.markdown(f"- {i}")
+            for title, tdf in anomalies.items():
+                with st.expander(f"{title} ({len(tdf)})"):
+                    st.dataframe(one_based(tdf.head(200)), use_container_width=True)
+            un = f[~f["tagged"]].groupby(["plant", "line", "machine"])["value"].sum().sort_values(ascending=False).reset_index()
+            if not un.empty:
+                with st.expander(f"Spend without a machine tag ({fmt_cur(un['value'].sum())})"):
+                    st.dataframe(one_based(un.rename(columns={"value": "Spend", "machine": "Cost centre"})), use_container_width=True)
+
+        # ---------------- CMMS link ----------------
+        cmms = cmms_link_table(f)
+        with t_cm:
+            st.subheader("OPEX spend vs CMMS work orders")
+            if cmms.empty:
+                st.info("No tagged spend to compare.")
+            else:
+                st.caption("Work orders are matched to machines by tag number. Spare parts issued without any work order point to a CMMS discipline gap.")
+                no_wo = cmms[(cmms["WOs"] == 0)].sort_values("Spend", ascending=False)
+                s1, s2, s3 = st.columns(3)
+                s1.metric("Machines with spend", len(cmms)); s2.metric("…without any work order", len(no_wo))
+                s3.metric("Spend with no work order", fmt_cur(no_wo["Spend"].sum()), delta=f"{no_wo['Spend'].sum() / max(cmms['Spend'].sum(), 1e-9) * 100:.0f}% of tagged spend", delta_color="off")
+                view = cmms.drop(columns=["machine_label", "In_Master", "Cum %"], errors="ignore").copy()
+                view["Spend"] = view["Spend"].round(0); view["Spend per breakdown"] = view["Spend per breakdown"].round(0)
+                st.markdown("**All machines**"); st.dataframe(one_based(view.head(300)), use_container_width=True)
+                st.markdown("**🚩 Spare parts issued but no work order recorded**")
+                st.dataframe(one_based(no_wo.drop(columns=["machine_label", "In_Master", "Cum %", "WOs", "Open WOs", "Breakdowns", "WO cost", "Spend per breakdown"], errors="ignore").head(50)), use_container_width=True)
+                brk = cmms[cmms["Breakdowns"] > 0].sort_values("Spend", ascending=False).head(15)
+                if not brk.empty:
+                    st.plotly_chart(px.scatter(brk, x="Breakdowns", y="Spend", size="Spend", hover_name="Machine", color="Plant", title="Spend vs breakdowns (machines with breakdown work orders)"), use_container_width=True)
+
+        # ---------------- export ----------------
+        with t_ex:
+            st.subheader("Export analysis")
+            st.caption("The Excel workbook contains: insights, by line, machine, part category, item group, top items, month, OPEX vs CMMS, anomaly lists and machines not in the Asset Master.")
+            e1, e2 = st.columns(2)
+            if e1.button("📊 Build Excel workbook", key="ox_xl_build"):
+                st.session_state.ox_xlsx = opex_excel(f, ins, anomalies, cmms)
+            if st.session_state.get("ox_xlsx"):
+                e1.download_button("⬇️ Download Excel", st.session_state.ox_xlsx, f"OPEX_Analysis_{datetime.now():%Y%m%d}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="ox_xl_dl")
+            if e2.button("📄 Build PDF summary", key="ox_pdf_build"):
+                st.session_state.ox_pdf = opex_pdf(f, ins)
+            if st.session_state.get("ox_pdf"):
+                e2.download_button("⬇️ Download PDF", st.session_state.ox_pdf, f"OPEX_Summary_{datetime.now():%Y%m%d}.pdf", "application/pdf", key="ox_pdf_dl")
 
 # --- MODULE 3: PLANNED MAINTENANCE ---
 elif menu == "📅 Planned Maintenance":
