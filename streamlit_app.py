@@ -7,6 +7,7 @@ from datetime import datetime
 import io
 import hashlib
 import json
+import re
 import uuid
 
 # --- 1. CONFIGURATION & AUTO-INSTALL ---
@@ -68,6 +69,51 @@ def read_upload(f):
     if openpyxl is None:
         raise ImportError("Excel support is missing. Add 'openpyxl' to requirements.txt (or upload a CSV file).")
     return pd.read_excel(f)
+
+def read_upload_all(f):
+    """Reads ALL sheets/tabs of an Excel file (Snacks, Pellet and any future sub-plant tab) or a CSV.
+    Returns (combined DataFrame with a '_sheet' column, {sheet name: row count})."""
+    if f.name.lower().endswith(".csv"):
+        d = pd.read_csv(f); d["_sheet"] = "CSV"
+        return d, {"CSV": len(d)}
+    if openpyxl is None:
+        raise ImportError("Excel support is missing. Add 'openpyxl' to requirements.txt (or upload a CSV file).")
+    frames, counts = [], {}
+    for name, d in pd.read_excel(f, sheet_name=None).items():
+        d = d.dropna(how="all")
+        if d.empty: continue
+        d = d.copy()
+        d.columns = [str(c).strip() for c in d.columns]
+        d["_sheet"] = str(name).strip()
+        frames.append(d); counts[str(name).strip()] = len(d)
+    return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), counts
+
+def normalize_assets_df(df):
+    """Maps any asset list (all tabs combined) to: name, tag, factory, site, section, line.
+    Column names are matched flexibly; Site falls back to the tab name (e.g. 'Snacks', 'Pellet')."""
+    cols = {}
+    for c in df.columns:
+        cols.setdefault(re.sub(r"\s+", " ", str(c)).strip().lower(), []).append(c)
+    def col(*names):
+        cs = [c for n in names for c in cols.get(n, [])]
+        if not cs: return pd.Series([""] * len(df), index=df.index)
+        ser = df[cs].bfill(axis=1).iloc[:, 0]
+        ser = ser.fillna("").astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+        return ser.replace({"nan": "", "None": "", "NaN": ""})
+    out = pd.DataFrame({
+        "name": col("name", "machine name", "machine", "asset", "asset name", "equipment", "description"),
+        "tag": col("tag", "tag number", "tag num", "tag no", "tag no.", "tag_number", "tagnumber", "asset id"),
+        "factory": col("factory", "plant factory"),
+        "site": col("site", "plant", "sub plant", "sub-plant", "subplant"),
+        "section": col("section"),
+        "line": col("line"),
+    })
+    if "_sheet" in df.columns:
+        sheet = df["_sheet"].astype(str).str.strip()
+        generic = sheet.str.lower().str.match(r"^(sheet\d*|csv|data|master|master data)$")
+        out["site"] = out["site"].where(out["site"] != "", sheet.where(~generic, ""))
+    out = out[(out["name"] != "") | (out["tag"] != "")].reset_index(drop=True)
+    return out
 
 # Machine Learning
 try:
@@ -555,7 +601,12 @@ def get_machine_data():
 
     if uploaded_file is not None:
         try:
-            return read_upload(uploaded_file)
+            raw, _counts = read_upload_all(uploaded_file)
+            n = normalize_assets_df(raw)
+            return pd.DataFrame({
+                "Machine Name": n["name"], "Brand": "Generic", "Manufacturer": "Generic",
+                "Tag Number": n["tag"], "Frequency": "Standard", "Site": n["site"], "Section": n["section"],
+                "Line": n["line"], "Factory": n["factory"]})
         except Exception as e:
             st.sidebar.error(f"Error reading file: {e}")
             return pd.DataFrame()
@@ -1803,7 +1854,7 @@ def h_asset_count(ctx):
     tbl, ch = None, None
     if "site" in f.columns and not ctx["group"]:
         g = f["site"].astype(str).value_counts()
-        tbl = g.reset_index(); tbl.columns = ["Site", "Assets"]
+        tbl = f.groupby([c for c in ["factory", "site"] if c in f.columns]).size().reset_index(name="Assets").rename(columns=str.title)
         ch = chart_spec("pie", g.index, g.values, "Assets by site") if charts_ok(ctx) else None
     return R(f"There are **{len(f)} assets**{lab}.", tbl, ch)
 
@@ -2425,34 +2476,38 @@ elif menu == "🛠️ Asset Master Data":
 
     with tab1:
         st.subheader("Import Assets from File")
-        uploaded_file = st.file_uploader("Choose a file", type=['csv', 'xlsx'], key="asset_import_upload")
+        uploaded_file = st.file_uploader("Choose a file (all tabs are read: Snacks, Pellet and any future sub-plant tab)", type=['csv', 'xlsx'], key="asset_import_upload")
         if uploaded_file is not None:
             try:
-                df_upload = read_upload(uploaded_file)
-                st.write("Preview:"); st.dataframe(one_based(df_upload.head()))
+                raw_up, tab_counts = read_upload_all(uploaded_file)
+                df_upload = normalize_assets_df(raw_up)
+                st.success("Tabs found: " + " · ".join(f"**{k}** ({v} rows)" for k, v in tab_counts.items()))
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Total rows", len(df_upload)); m2.metric("Tabs / sub-plants", len(tab_counts))
+                m3.metric("Factories", df_upload["factory"].replace("", pd.NA).nunique())
+                m4.metric("Duplicate tags", int(df_upload[df_upload["tag"] != ""]["tag"].str.lower().duplicated().sum()))
+                if not df_upload.empty:
+                    st.write("Summary (Factory › Site):")
+                    summ = df_upload.groupby(["factory", "site"]).size().reset_index(name="Assets")
+                    st.dataframe(one_based(summ.rename(columns=str.title)), use_container_width=True)
+                st.write("Preview:"); st.dataframe(one_based(df_upload.head(10).rename(columns=str.title)))
                 if st.button("Import Data"):
-                    lookup = {str(c).strip().lower(): c for c in df_upload.columns}
-                    def pick(*names):
-                        for n in names:
-                            if n in lookup: return lookup[n]
-                        return None
-                    c_name = pick('name', 'machine name', 'machine', 'asset', 'asset name', 'description')
-                    c_tag = pick('tag', 'tag number', 'tag num', 'tag no', 'tag no.', 'tag_number', 'tagnumber')
-                    c_site = pick('site', 'plant', 'location')
-                    c_sec = pick('section')
-                    c_line = pick('line')
-                    c_fac = pick('factory')
-                    def val(row, col, default):
-                        if col is None or pd.isna(row[col]): return default
-                        return str(row[col])
-                    for index, row in df_upload.iterrows():
-                        data = {"name": val(row, c_name, 'N/A'), "tag": val(row, c_tag, 'N/A'), "site": val(row, c_site, 'General'), "created_at": str(datetime.now())}
-                        if c_sec is not None: data["section"] = val(row, c_sec, '')
-                        if c_line is not None: data["line"] = val(row, c_line, '')
-                        if c_fac is not None: data["factory"] = val(row, c_fac, '')
-                        save_document('assets', data, notify=False)
-                    log_notification(f"🛠️ {len(df_upload)} assets imported", toast=False)
-                    st.success("Imported!"); time.sleep(1); st.rerun()
+                    existing = {str(d.get("tag", "")).strip().lower(): d for d in st.session_state.store.get("assets", []) if str(d.get("tag", "")).strip()}
+                    added = updated = skipped = 0
+                    seen = set()
+                    for rec in df_upload.to_dict("records"):
+                        key = rec["tag"].lower()
+                        if key and key in seen: skipped += 1; continue      # duplicate tag inside the file
+                        if key: seen.add(key)
+                        data = {k: rec[k] for k in ["name", "tag", "factory", "site", "section", "line"] if rec[k] != ""}
+                        data.setdefault("name", "N/A"); data.setdefault("site", "General")
+                        if key and key in existing:                          # already stored -> update, never duplicate
+                            existing[key].update(data); updated += 1; st.session_state.dirty += 1
+                        else:
+                            data["created_at"] = str(datetime.now())
+                            save_document('assets', data, notify=False); added += 1
+                    log_notification(f"🛠️ Assets imported: {added} new, {updated} updated", toast=False)
+                    st.success(f"Imported! {added} new · {updated} updated · {skipped} duplicate rows skipped"); time.sleep(1.5); st.rerun()
             except Exception as e: st.error(f"Error: {e}")
 
         st.divider(); st.subheader("Add Single Asset Manually")
@@ -2464,7 +2519,22 @@ elif menu == "🛠️ Asset Master Data":
                 st.success("Saved"); st.rerun()
 
     with tab2:
-        if not df_assets.empty: st.dataframe(one_based(df_assets), use_container_width=True)
+        if not df_assets.empty:
+            view_df = df_assets
+            fcols = st.columns(4)
+            for (col, lab), box in zip([("factory", "Factory"), ("site", "Site / Sub-plant"), ("section", "Section"), ("line", "Line")], fcols):
+                if col in view_df.columns:
+                    opts = sorted(view_df[col].dropna().astype(str).unique())
+                    sel = box.multiselect(lab, opts, key=f"md_f_{col}")
+                    if sel: view_df = view_df[view_df[col].astype(str).isin(sel)]
+            if "site" in df_assets.columns:
+                counts = df_assets["site"].astype(str).value_counts()
+                mc = st.columns(min(len(counts) + 1, 6))
+                mc[0].metric("Total assets", len(df_assets))
+                for i, (k, v) in enumerate(counts.items()):
+                    if i + 1 < len(mc): mc[i + 1].metric(k, int(v))
+            st.caption(f"Showing {len(view_df)} of {len(df_assets)} assets")
+            st.dataframe(one_based(view_df), use_container_width=True)
         else: st.info("No assets found.")
 
     with tab3:
@@ -2635,4 +2705,4 @@ elif menu == "💼 Maintenance Manager":
     risk = st.number_input("Risk", 50000)
     total = base * (1 + inf) + risk
     st.metric("2026 Forecast", f"${total:,.0f}")
-    st.plotly_chart(go.Figure(go.Waterfall(measure=["relative", "relative", "relative", "total"], x=["Base", "Inflation", "Risk", "Total"], y=[base, base*inf, risk, total])))
+    st.plotly_chart(go.Figure(go.Waterfall(measure=["relative", "relative", "relative", "total"], x=["Base", "Inflation", "Risk", "Total"], y=[base, base*inf, risk, total]))) risk, total])))
