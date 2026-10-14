@@ -1673,7 +1673,8 @@ def parse_opex_report(f):
         if h is None: continue
         d = df0.iloc[h + 1:].copy()
         d.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df0.iloc[h].tolist()]
-        frames.append(d.dropna(how="all"))
+        d["_src_row"] = d.index + 1          # row number in the original Excel sheet
+        frames.append(d.dropna(how="all", subset=[c for c in d.columns if c != "_src_row"]))
     if not frames:
         raise ValueError("Could not find the report table. Expected columns like Item Code, Description, General Dept, Dept, Net Cost / Value, GL Date.")
     raw = pd.concat(frames, ignore_index=True)
@@ -1718,6 +1719,7 @@ def parse_opex_report(f):
     out["item_type"] = col("type").astype(str).str.strip().replace({"None": "", "nan": ""})
     out["budget"] = num(col("budget"))
     out["source"] = name
+    out["src_row"] = pd.to_numeric(raw["_src_row"], errors="coerce") if "_src_row" in raw.columns else np.nan
     out = out[out["value"].notna()].reset_index(drop=True)
     return out
 
@@ -1739,11 +1741,11 @@ def opex_df():
     """Stored OPEX lines as an analysis DataFrame (adds item group, part category, master-match flag)."""
     rows = st.session_state.store.get("opex", [])
     cols = ["item_code", "description", "uom", "general_dept", "dept", "tag", "machine", "plant", "section", "line", "issue_qty", "return_qty",
-            "issue_cost", "return_cost", "value", "gl_date", "period", "month", "quarter", "account_type", "item_type", "budget", "source",
+            "issue_cost", "return_cost", "value", "gl_date", "period", "month", "quarter", "account_type", "item_type", "budget", "source", "src_row",
             "item_group", "part_category", "machine_label", "in_master", "tagged"]
     if not rows: return pd.DataFrame(columns=cols)
     d = pd.DataFrame(rows)
-    for c in ["issue_qty", "return_qty", "issue_cost", "return_cost", "value", "budget"]:
+    for c in ["issue_qty", "return_qty", "issue_cost", "return_cost", "value", "budget", "src_row"]:
         d[c] = pd.to_numeric(d.get(c), errors="coerce")
     for c in ["tag", "machine", "plant", "section", "line", "description", "item_code", "general_dept", "dept", "period"]:
         d[c] = d[c].fillna("").astype(str) if c in d.columns else ""
@@ -1786,52 +1788,154 @@ def machine_table(f):
     g["Cum %"] = g["Share %"].cumsum()
     return g
 
-def opex_insights(f):
-    """Returns (list of insight sentences, dict of anomaly tables)."""
-    ins, tabs = [], {}
-    if f.empty: return ins, tabs
-    tot = f["value"].sum(); mt = machine_table(f[f["tagged"]])
-    ins.append(f"Total spare-parts spend **{fmt_cur(tot)}** on **{len(f)}** issue lines across **{f['machine_label'].nunique()}** machines/cost centres.")
-    untag = f.loc[~f["tagged"], "value"].sum()
-    if tot and untag / tot > 0.05:
-        ins.append(f"⚠️ **{untag / tot * 100:.1f}%** of the spend ({fmt_cur(untag)}) was issued to a department with **no machine tag** (general/workshop). Ask storekeepers to issue to a machine so costs can be traced.")
+SEV_ICON = {"high": "🔴", "medium": "🟠", "low": "🟡", "info": "ℹ️"}
+SEV_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
+
+def _dsc(desc, cat):
+    """Short English-friendly label for an item: category + any Latin part numbers found in the (Arabic) description."""
+    lat = " ".join(re.findall(r"[A-Za-z0-9][A-Za-z0-9\-:+./()#]*", str(desc)))
+    return (str(cat) + (" - " + lat if lat else ""))[:70]
+
+def _line_table(df):
+    """Standard detail table for issue lines (keeps the original Excel row number when known)."""
+    t = pd.DataFrame(index=df.index)
+    if "src_row" in df.columns and df["src_row"].notna().any(): t["Report row"] = df["src_row"].apply(lambda x: "" if pd.isna(x) else int(x))
+    t["Date"] = pd.to_datetime(df["gl_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    t["Plant"] = df["plant"]; t["Line"] = df["line"]; t["Machine / cost centre"] = df["machine_label"]
+    t["Item code"] = df["item_code"]; t["Description"] = df["description"]; t["Category"] = df["part_category"]
+    t["Qty"] = -df["issue_qty"]; t["Value"] = df["value"].round(2)
+    return t.reset_index(drop=True)
+
+def opex_findings(f):
+    """Structured findings. Each: key, severity, title, summary (with the actual names/numbers), why, action, table (DataFrame or None)."""
+    F = []
+    if f.empty: return F
+    tot = f["value"].sum(); share = lambda v: (v / tot * 100 if tot else 0)
+    def add(key, sev, title, summary, why, action, table=None):
+        F.append({"key": key, "severity": sev, "title": title, "summary": summary, "why": why, "action": action,
+                  "table": table if table is not None and len(table) else None})
+    def lbl(r): return f"{_dsc(r['description'], r['part_category'])} [{r['item_code']}]"
+
+    # ---- untagged spend
+    ut = f[~f["tagged"]]
+    if not ut.empty and ut["value"].sum() > 0:
+        u = ut["value"].sum(); top = ut.sort_values("value", ascending=False).head(3)
+        ex = "; ".join(f"{fmt_cur(r['value'])} - {lbl(r)} to {r['machine']} ({r['plant']} {r['line']}) on {pd.Timestamp(r['gl_date']):%d %b}" for _, r in top.iterrows())
+        add("untagged", "high" if share(u) > 15 else "medium" if share(u) > 5 else "low", "Spend with no machine tag",
+            f"{share(u):.1f}% of the spend ({fmt_cur(u)}, {len(ut)} lines) was issued to cost centres without a machine tag. Largest: {ex}.",
+            "These costs cannot be attributed to a machine, so machine spend, bad-actor ranking and cost-per-breakdown are understated.",
+            "Re-issue / transfer the large untagged items to the machine that used them, and require a machine tag at issue time in the ERP.",
+            _line_table(ut.sort_values("value", ascending=False).head(60)))
+    # ---- not in asset master
+    nm = f[f["tagged"] & ~f["in_master"]]
+    if not nm.empty:
+        g = nm.groupby(["tag", "machine", "plant", "section", "line"]).agg(Spend=("value", "sum"), Lines=("value", "size")).reset_index().sort_values("Spend", ascending=False)
+        ex = ", ".join(f"{r.machine} ({r.tag}, {fmt_cur(r.Spend)})" for r in g.head(4).itertuples())
+        add("master", "medium" if share(nm["value"].sum()) > 10 else "low", "Machines missing from the Asset Master",
+            f"{len(g)} machine tags in the report ({fmt_cur(nm['value'].sum())}, {share(nm['value'].sum()):.1f}% of spend) are not in the Asset Master. Biggest: {ex}.",
+            "Without an asset record these machines have no QR label, PM plan or work-order history, so spend cannot be compared with maintenance activity.",
+            "Use 'Add these machines to the Asset Master' in the Upload Report tab (or add them to the master Excel file), then print their QR labels.",
+            g.rename(columns={"tag": "Tag", "machine": "Machine", "plant": "Plant", "section": "Section", "line": "Line"}))
+    # ---- concentration + outliers
+    mt = machine_table(f[f["tagged"]])
     if not mt.empty:
         n80 = int((mt["Cum %"] < 80).sum() + 1)
-        ins.append(f"📊 **{n80} machines** ({n80 / len(mt) * 100:.0f}% of tagged machines) account for 80% of the tagged spend. Biggest: **{mt.iloc[0]['Machine']}** ({mt.iloc[0]['Tag']}) with {fmt_cur(mt.iloc[0]['Spend'])} ({mt.iloc[0]['Share %']:.1f}%).")
+        add("pareto", "info", "Spend concentration (80/20)",
+            f"{n80} machines ({n80 / len(mt) * 100:.0f}% of {len(mt)} tagged machines) account for 80% of tagged spend. Top 3: " +
+            ", ".join(f"{r.Machine} ({r.Tag}) {fmt_cur(r.Spend)}" for r in mt.head(3).itertuples()) + ".",
+            "A small group of machines drives most of the cost - improvement effort there pays back fastest.",
+            "Review the work-order and breakdown history of these machines first (OPEX vs CMMS tab) and plan root-cause or overhaul actions.",
+            mt.head(n80)[["Machine", "Tag", "Plant", "Line", "Spend", "Share %", "Cum %"]].round(1))
         q1, q3 = mt["Spend"].quantile(0.25), mt["Spend"].quantile(0.75); lim = q3 + 1.5 * (q3 - q1)
-        out = mt[mt["Spend"] > lim][["Machine", "Tag", "Plant", "Line", "Spend", "Lines"]]
+        out = mt[mt["Spend"] > lim]
         if not out.empty:
-            tabs["High-spend machines (statistical outliers)"] = out
-            ins.append(f"🚩 **{len(out)} machines** are statistical outliers (spend above {fmt_cur(lim)}).")
+            add("outliers", "medium", "High-spend machines (statistical outliers)",
+                f"{len(out)} machines spend far above the typical machine (above {fmt_cur(lim)}). Highest: " + ", ".join(f"{r.Machine} ({r.Tag}) {fmt_cur(r.Spend)}" for r in out.head(4).itertuples()) + ".",
+                "Their consumption is outside the normal range of the plant - either a real problem machine or a few expensive one-off parts.",
+                "Check the big-ticket and repeat-consumption findings for these machines to see whether it is one expensive part or repeated failures.",
+                out[["Machine", "Tag", "Plant", "Line", "Spend", "Lines"]].round(0))
+    # ---- big tickets
     lim = max(f["value"].quantile(0.95), f["value"].mean() + 3 * f["value"].std(ddof=0)) if len(f) > 5 else f["value"].max()
     big = f[f["value"] >= lim].sort_values("value", ascending=False)
     if not big.empty:
-        tabs["Big-ticket issues"] = big[["gl_date", "machine_label", "item_code", "description", "issue_qty", "value"]]
-        ins.append(f"💰 **{len(big)} big-ticket issues** (>= {fmt_cur(lim)}) total **{fmt_cur(big['value'].sum())}** ({big['value'].sum() / tot * 100:.0f}% of spend).")
-    rep = f[f["tagged"] & (f["item_code"] != "")].groupby(["machine_label", "item_code", "description"]).agg(Times=("value", "size"), Qty=("issue_qty", lambda s: -s.sum()), Spend=("value", "sum")).reset_index()
+        multi = big[big["item_code"] != ""].groupby("item_code").agg(n=("value", "size"), m=("machine_label", lambda s: ", ".join(list(dict.fromkeys(s))[:3])), d=("description", "first"), c=("part_category", "first")).query("n > 1")
+        mtxt = (" Same expensive part issued to several machines: " + "; ".join(f"{_dsc(r.d, r.c)} [{i}] on {r.m}" for i, r in multi.head(2).iterrows()) + ".") if not multi.empty else ""
+        add("bigticket", "medium" if share(big["value"].sum()) > 30 else "low", "Big-ticket issues",
+            f"{len(big)} single issues of {fmt_cur(lim)} or more add up to {fmt_cur(big['value'].sum())} ({share(big['value'].sum()):.0f}% of spend). Largest: " +
+            "; ".join(f"{fmt_cur(r['value'])} - {lbl(r)} to {r['machine_label']}" for _, r in big.head(3).iterrows()) + "." + mtxt,
+            "A handful of expensive components decide the monthly total. They may be justified failures, planned replacements or stock build-up.",
+            "Confirm each has a work order / failure reason, decide whether a critical spare should be repaired or kept in stock, and check if the cost is capital rather than maintenance.",
+            _line_table(big))
+    # ---- repeat consumption
+    rep = f[f["tagged"] & (f["item_code"] != "")].groupby(["machine_label", "item_code"]).agg(Times=("value", "size"), Qty=("issue_qty", lambda s: -s.sum()), Spend=("value", "sum"), d=("description", "first"), c=("part_category", "first")).reset_index()
     rep = rep[rep["Times"] >= 3].sort_values("Spend", ascending=False)
     if not rep.empty:
-        tabs["Repeat consumption (same part, same machine, 3+ issues)"] = rep
-        ins.append(f"🔁 **{len(rep)} part/machine combinations** were issued 3+ times - possible chronic failures worth a root-cause review.")
+        t = rep.assign(Description=rep["d"], Category=rep["c"]).rename(columns={"machine_label": "Machine", "item_code": "Item code"})[["Machine", "Item code", "Description", "Category", "Times", "Qty", "Spend"]].round(1)
+        add("repeat", "medium", "Same part issued repeatedly to the same machine",
+            f"{len(rep)} machine/part combinations were issued 3+ times. Top: " + "; ".join(f"{r.machine_label}: {_dsc(r.d, r.c)} [{r.item_code}] x{int(r.Times)} (qty {r.Qty:g}, {fmt_cur(r.Spend)})" for r in rep.head(3).itertuples()) + ".",
+            "Frequent re-issue of the same part usually signals a chronic failure, poor-quality part or a wrong repair.",
+            "Open a root-cause review for the top machines, compare with their breakdown work orders and consider a better-quality part or a PM task.",
+            t)
+    # ---- unit-cost variance
     f2 = f.copy(); f2["uc"] = f2["value"] / f2["issue_qty"].abs().replace(0, np.nan)
-    pv = f2[f2["item_code"] != ""].groupby(["item_code", "description"]).agg(Min=("uc", "min"), Max=("uc", "max"), Lines=("uc", "size")).reset_index()
+    pv = f2[f2["item_code"] != ""].groupby("item_code").agg(Min=("uc", "min"), Max=("uc", "max"), Lines=("uc", "size"), d=("description", "first"), c=("part_category", "first")).reset_index()
     pv = pv[(pv["Lines"] >= 2) & (pv["Min"] > 0) & (pv["Max"] / pv["Min"] > 1.5)]
     if not pv.empty:
-        pv["Max/Min"] = pv["Max"] / pv["Min"]
-        tabs["Unit-cost variance (same item, different price)"] = pv.sort_values("Max/Min", ascending=False)
-        ins.append(f"🏷️ **{len(pv)} items** show unit-cost differences above 50% between issues (stock valuation / purchase price check).")
-    dup = f[f.duplicated(["item_code", "dept", "general_dept", "gl_date", "issue_qty", "value"], keep=False) & (f["item_code"] != "")]
+        parts = []
+        for r in pv.sort_values("Max", ascending=False).head(3).itertuples():
+            hi = f2[(f2["item_code"] == r.item_code) & (f2["uc"] >= r.Max * 0.99)]["machine_label"].tolist()
+            parts.append(f"{_dsc(r.d, r.c)} [{r.item_code}]: unit cost between {r.Min:,.2f} and {r.Max:,.2f} (+{(r.Max / r.Min - 1) * 100:.0f}%) over {r.Lines} issues; highest price charged to {', '.join(hi[:3])}")
+        lines = f2[f2["item_code"].isin(pv["item_code"])].sort_values(["item_code", "uc"], ascending=[True, False])
+        t = _line_table(lines); t["Unit cost"] = lines["uc"].round(2).values
+        add("price", "low", "Same item charged at different unit costs",
+            f"{len(pv)} item(s) were valued at clearly different unit costs in the same period. " + " | ".join(parts) + ".",
+            "Identical items should cost the same unless they come from different purchase lots or the ERP uses average/FIFO costing; otherwise some machines are over- or under-charged.",
+            "Check the item's cost history / costing method in the ERP and the purchase invoices; correct the valuation if it is a mistake.",
+            t)
+    # ---- duplicates
+    key = ["item_code", "dept", "general_dept", "gl_date", "issue_qty", "value"]
+    dup = f[f.duplicated(key, keep=False) & (f["item_code"] != "")]
     if not dup.empty:
-        tabs["Possible duplicate issue lines"] = dup.sort_values(["item_code", "dept"])[["gl_date", "machine_label", "item_code", "description", "issue_qty", "value"]]
-        ins.append(f"♊ **{len(dup)} lines** look like duplicates (same item, department, date, qty and value) - verify they are not double postings.")
-    z = f[f["value"] <= 0]
+        g = dup.groupby(key, dropna=False).agg(n=("value", "size"), d=("description", "first"), c=("part_category", "first"), m=("machine_label", "first")).reset_index()
+        risk = float(((g["n"] - 1) * g["value"]).sum())
+        add("duplicates", "medium" if share(risk) > 1 else "low", "Possible duplicate issue lines",
+            f"{len(g)} item(s) appear more than once with identical date, department, quantity and value: " +
+            "; ".join(f"{_dsc(r.d, r.c)} [{r.item_code}] issued {int(r.n)}x on {pd.Timestamp(r.gl_date):%d %b} to {r.m}, qty {-r.issue_qty:g}, {fmt_cur(r.value, 2)} each" for r in g.head(3).itertuples()) +
+            f". Value at risk if one is a double posting: {fmt_cur(risk, 2)}.",
+            "Identical lines can be genuine repeat issues (e.g. two rolls handed out separately) or the same transaction posted twice.",
+            "Check the store issue slips for these lines (use the report row numbers). If it is a double posting, reverse one line in the ERP.",
+            _line_table(dup.sort_values(["item_code", "dept"])))
+    # ---- zero / negative
+    z = f[f["value"] <= 0].copy()
     if not z.empty:
-        tabs["Zero / negative value lines"] = z[["gl_date", "machine_label", "item_code", "description", "issue_qty", "value"]]
-        ins.append(f"🧾 **{len(z)} lines** have zero or negative value (returns or items without a valuation).")
-    nm = f[f["tagged"] & ~f["in_master"]]
-    if not nm.empty:
-        ins.append(f"🛠️ **{nm['tag'].nunique()} machine tags** in the report ({fmt_cur(nm['value'].sum())}) are **not in the Asset Master** - add them so their QR codes, PM and work orders can be linked.")
-    return ins, tabs
+        def reason(r):
+            if r["return_qty"] and r["return_qty"] != 0 and abs(r["return_cost"]) > 0: return "Issued and fully returned (net zero)"
+            if r["value"] == 0: return "Issued with zero valuation (item cost missing in ERP)"
+            return "Net credit (return larger than issue)"
+        z["Reason"] = z.apply(reason, axis=1)
+        miss = z[z["Reason"].str.startswith("Issued with zero")]
+        t = _line_table(z); t["Reason"] = z["Reason"].values
+        add("zero", "medium" if len(miss) else "info", "Zero or negative value lines",
+            f"{len(z)} lines have no spend: {len(miss)} issued without a valuation, {int(z['Reason'].str.startswith('Issued and').sum())} fully returned. " +
+            ("Missing valuation: " + "; ".join(f"{lbl(r)} x{-r['issue_qty']:g} to {r['machine_label']}" for _, r in miss.head(3).iterrows()) + "." if len(miss) else ""),
+            "Items issued at zero cost understate the real spend of those machines; fully returned items are normal and need no action.",
+            "Ask purchasing/stores to set a cost for the items with missing valuation so they are charged correctly.",
+            t)
+    # ---- categories + coverage
+    pc = f.groupby("part_category")["value"].sum().sort_values(ascending=False)
+    if len(pc):
+        add("category", "info", "Where the money goes (part categories)",
+            ", ".join(f"{k} {fmt_cur(v)} ({share(v):.0f}%)" for k, v in pc.head(3).items()) + " are the three biggest categories.",
+            "Shows which type of spare part drives cost - electronics and printing parts are usually imported, high-value items.",
+            "Review stocking, repair-vs-replace and supplier strategy for the top categories.",
+            pc.reset_index().rename(columns={"part_category": "Category", "value": "Spend"}).assign(**{"Share %": (pc.values / tot * 100).round(1)}).round(0))
+    if f["period"].nunique() == 1:
+        add("period", "info", "Only one month loaded",
+            f"Only {f['period'].iloc[0]} is loaded, so trends, budget tracking and seasonality cannot be shown yet.",
+            "Month-over-month analysis needs at least two monthly reports.",
+            "Upload the other months (each report replaces its own month, so re-uploading is safe).")
+    F.sort(key=lambda x: SEV_ORDER[x["severity"]])
+    return F
 
 def _wo_tag(r):
     m = re.search(r"(AMER-[A-Z0-9]+(?:-[A-Z0-9]+)+)", str(r.get("asset_name", "")).upper())
@@ -1856,10 +1960,13 @@ def cmms_link_table(f):
     mt["Spend per breakdown"] = np.where(mt["Breakdowns"] > 0, mt["Spend"] / mt["Breakdowns"].replace(0, np.nan), np.nan)
     return mt
 
-def opex_excel(f, ins, tabs, cmms):
+def opex_excel(f, fnd, cmms):
+    names = {"untagged": "Untagged spend", "master": "Not in Asset Master", "pareto": "Top machines 80pct", "outliers": "High-spend machines",
+             "bigticket": "Big-ticket issues", "repeat": "Repeat consumption", "price": "Unit-cost variance", "duplicates": "Possible duplicates", "zero": "Zero-negative lines"}
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        pd.DataFrame({"Insight": [re.sub(r"[*]", "", i) for i in ins]}).to_excel(xw, sheet_name="Insights", index=False)
+        pd.DataFrame([{"#": i + 1, "Severity": x["severity"].title(), "Finding": x["title"], "Details": re.sub(r"[*]", "", x["summary"]),
+                       "What it means": x["why"], "Recommended action": x["action"]} for i, x in enumerate(fnd)]).to_excel(xw, sheet_name="Findings", index=False)
         f.groupby(["plant", "section", "line"]).agg(Spend=("value", "sum"), Lines=("value", "size"), Machines=("machine_label", "nunique")).reset_index().sort_values("Spend", ascending=False).to_excel(xw, sheet_name="By Line", index=False)
         mt = machine_table(f)
         if not mt.empty: mt.drop(columns=["machine_label"]).to_excel(xw, sheet_name="By Machine", index=False)
@@ -1868,44 +1975,77 @@ def opex_excel(f, ins, tabs, cmms):
         f.groupby(["item_code", "description"]).agg(Qty=("issue_qty", lambda s: -s.sum()), Spend=("value", "sum"), Machines=("machine_label", "nunique")).reset_index().sort_values("Spend", ascending=False).head(500).to_excel(xw, sheet_name="Top Items", index=False)
         if f["period"].nunique() > 1: f.groupby("period").agg(Spend=("value", "sum"), Lines=("value", "size")).reset_index().to_excel(xw, sheet_name="By Month", index=False)
         if cmms is not None and not cmms.empty: cmms.drop(columns=["machine_label"], errors="ignore").to_excel(xw, sheet_name="OPEX vs CMMS", index=False)
-        for i, (k, v) in enumerate(tabs.items()):
-            v.to_excel(xw, sheet_name=(re.sub(r"[\\/*?:\[\]]", "-", k.split(" (")[0])[:31] or f"Anomaly{i}"), index=False)
-        un = f[f["tagged"] & ~f["in_master"]].groupby(["tag", "machine", "plant", "section", "line"]).agg(Spend=("value", "sum")).reset_index()
-        if not un.empty: un.to_excel(xw, sheet_name="Not in Asset Master", index=False)
+        for x in fnd:
+            if x["table"] is not None and x["key"] in names: x["table"].to_excel(xw, sheet_name=names[x["key"]], index=False)
+        from openpyxl.styles import Alignment
         for ws in xw.book.worksheets:
             ws.freeze_panes = "A2"
             for col_cells in ws.columns:
                 w = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells[:60])
                 ws.column_dimensions[col_cells[0].column_letter].width = min(max(w + 2, 10), 60)
+        wsf = xw.book["Findings"]
+        for col, w in zip("CDEF", (34, 90, 60, 60)): wsf.column_dimensions[col].width = w
+        for row in wsf.iter_rows(min_row=2):
+            for c in row: c.alignment = Alignment(wrap_text=True, vertical="top")
     return buf.getvalue()
 
-def opex_pdf(f, ins):
-    pdf = FPDF(); pdf.add_page()
+def _pdf_safe_table(t):
+    t = t.copy()
+    if "Description" in t.columns and "Category" in t.columns:
+        t["Description"] = [_dsc(d, c) for d, c in zip(t["Description"], t["Category"])]; t = t.drop(columns=["Category"])
+    elif "Description" in t.columns:
+        t["Description"] = [" ".join(re.findall(r"[A-Za-z0-9][A-Za-z0-9\-:+./()#]*", str(d))) or "(Arabic - see Excel)" for d in t["Description"]]
+    return t.drop(columns=[c for c in ("Plant",) if c in t.columns])
+
+PDF_COLW = {"Report row": 13, "Date": 17, "Line": 15, "Machine / cost centre": 40, "Machine": 38, "Item code": 20, "Description": 52, "Qty": 10, "Value": 17, "Spend": 18,
+            "Reason": 40, "Unit cost": 14, "Times": 11, "Tag": 38, "Share %": 14, "Cum %": 13, "Lines": 11, "Section": 18, "Category": 40, "Month": 14}
+
+def opex_pdf(f, fnd):
+    pdf = FPDF(); pdf.set_auto_page_break(True, 15); pdf.add_page()
     pdf.set_font("Arial", "B", 16); pdf.cell(0, 10, "Americana Foods - EP Plants", 0, 1)
-    pdf.set_font("Arial", "B", 13); pdf.cell(0, 8, _lat("Spare Parts Spend (OPEX) Analysis"), 0, 1)
-    pdf.set_font("Arial", "I", 9); pdf.cell(0, 6, _lat(f"Periods: {', '.join(sorted(f['period'].unique()))}  |  Generated {datetime.now():%Y-%m-%d %H:%M}"), 0, 1)
+    pdf.set_font("Arial", "B", 13); pdf.cell(0, 8, "Spare Parts Spend (OPEX) Analysis", 0, 1)
+    pdf.set_font("Arial", "I", 9); pdf.cell(0, 6, _lat(f"Periods: {', '.join(sorted(f['period'].unique()))}  |  Total {fmt_cur(f['value'].sum())}  |  Generated {datetime.now():%Y-%m-%d %H:%M}"), 0, 1)
     pdf.line(10, pdf.get_y() + 1, 200, pdf.get_y() + 1); pdf.ln(4)
-    pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, "Key findings", 0, 1); pdf.set_font("Arial", "", 9)
-    for i in ins:
-        t = re.sub(r"[*]", "", i).encode("ascii", "ignore").decode().strip(" ")
-        pdf.multi_cell(0, 5, _lat("- " + t)); pdf.ln(1)
-    def table(title, df, widths, heads):
-        pdf.ln(3); pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, title, 0, 1)
-        pdf.set_fill_color(220, 228, 236); pdf.set_font("Arial", "B", 8)
-        for w, h in zip(widths, heads): pdf.cell(w, 6, h, 1, 0, "C", True)
-        pdf.ln(); pdf.set_font("Arial", "", 8)
-        for row in df.itertuples(index=False):
-            for w, v in zip(widths, row):
-                txt = f"{v:,.0f}" if isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool) else _lat(str(v))[:int(w / 1.9)]
-                pdf.cell(w, 5.5, txt, 1, 0, "R" if isinstance(v, (int, float, np.floating, np.integer)) else "L")
+    clean = lambda t: _lat(re.sub(r"[*]", "", str(t)))
+    tag = {"high": "[HIGH]", "medium": "[MEDIUM]", "low": "[LOW]", "info": "[INFO]"}
+
+    def table(df, max_rows=15):
+        df = _pdf_safe_table(df); shown = df.head(max_rows)
+        widths = [PDF_COLW.get(c, 20) for c in shown.columns]; k = 190 / sum(widths); widths = [w * k for w in widths]
+        pdf.set_fill_color(220, 228, 236); pdf.set_font("Arial", "B", 7)
+        for w, h in zip(widths, shown.columns): pdf.cell(w, 5.5, _lat(h)[:int(w / 1.5)], 1, 0, "C", True)
+        pdf.ln(); pdf.set_font("Arial", "", 7)
+        for row in shown.itertuples(index=False):
+            for w, v, c in zip(widths, row, shown.columns):
+                if isinstance(v, (int, float, np.floating, np.integer)) and not isinstance(v, bool):
+                    txt = "" if pd.isna(v) else (f"{v:,.0f}" if abs(v) >= 100 or float(v).is_integer() else f"{v:,.2f}")
+                    pdf.cell(w, 5, txt, 1, 0, "R")
+                else: pdf.cell(w, 5, _lat("" if v is None else v)[:int(w / 1.45)], 1, 0, "L")
             pdf.ln()
-    pl = f.groupby(["plant", "section", "line"]).agg(S=("value", "sum"), L=("value", "size")).reset_index().sort_values("S", ascending=False).head(20)
-    table("Spend by plant / section / line", pl, [30, 35, 55, 35, 25], ["Plant", "Section", "Line", f"Spend ({cur_label()})", "Lines"])
+        if len(df) > max_rows:
+            pdf.set_font("Arial", "I", 7); pdf.cell(0, 5, f"... showing {max_rows} of {len(df)} lines - the full list is in the Excel export and in the app.", 0, 1)
+
+    pdf.set_font("Arial", "B", 12); pdf.cell(0, 7, "Key findings", 0, 1)
+    for x in fnd:
+        pdf.set_font("Arial", "B", 9); pdf.multi_cell(0, 5, clean(f"{tag[x['severity']]} {x['title']}"))
+        pdf.set_font("Arial", "", 8.5); pdf.multi_cell(0, 4.5, clean(x["summary"])); pdf.ln(1.5)
+    pdf.add_page(); pdf.set_font("Arial", "B", 12); pdf.cell(0, 7, "Findings in detail", 0, 1)
+    for x in fnd:
+        if x["severity"] == "info" and x["table"] is None: continue
+        pdf.ln(2); pdf.set_font("Arial", "B", 10); pdf.set_fill_color(240, 244, 248)
+        pdf.multi_cell(0, 6, clean(f"{tag[x['severity']]} {x['title']}"), 0, "L", True)
+        pdf.set_font("Arial", "B", 8); pdf.cell(26, 4.5, "What it means:", 0, 0); pdf.set_font("Arial", "", 8); pdf.multi_cell(0, 4.5, clean(x["why"]))
+        pdf.set_font("Arial", "B", 8); pdf.cell(26, 4.5, "Action:", 0, 0); pdf.set_font("Arial", "", 8); pdf.multi_cell(0, 4.5, clean(x["action"])); pdf.ln(1)
+        if x["table"] is not None: table(x["table"])
+    pdf.add_page(); pdf.set_font("Arial", "B", 12); pdf.cell(0, 7, "Spend summary tables", 0, 1)
+    pl = f.groupby(["plant", "section", "line"]).agg(Spend=("value", "sum"), Lines=("value", "size")).reset_index().sort_values("Spend", ascending=False)
+    pdf.set_font("Arial", "B", 10); pdf.cell(0, 7, "Spend by plant / section / line", 0, 1)
+    pl["Plant"] = pl["plant"]; table(pl.rename(columns={"line": "Line", "section": "Section"})[["Plant", "Section", "Line", "Spend", "Lines"]], 30)
     mt = machine_table(f[f["tagged"]]).head(15)
     if not mt.empty:
-        table("Top 15 machines", mt[["Machine", "Tag", "Line", "Spend", "Share %"]].assign(**{"Share %": mt["Share %"].round(1)}), [45, 55, 30, 30, 25], ["Machine", "Tag", "Line", f"Spend ({cur_label()})", "Share %"])
-    pc = f.groupby("part_category")["value"].sum().sort_values(ascending=False).reset_index()
-    table("Spend by part category", pc, [110, 50], ["Category", f"Spend ({cur_label()})"])
+        pdf.ln(3); pdf.set_font("Arial", "B", 10); pdf.cell(0, 7, "Top 15 machines", 0, 1); table(mt[["Machine", "Tag", "Line", "Spend", "Share %"]].round(1))
+    pc = f.groupby("part_category")["value"].sum().sort_values(ascending=False).reset_index().rename(columns={"part_category": "Category", "value": "Spend"})
+    pdf.ln(3); pdf.set_font("Arial", "B", 10); pdf.cell(0, 7, "Spend by part category", 0, 1); table(pc, 20)
     return pdf.output(dest="S").encode("latin-1", "replace")
 
 
@@ -1931,7 +2071,8 @@ INTENT_EXAMPLES = {
     "total_spend": ["total maintenance spend", "how much did we spend", "total cost", "what is the total spending",
                     "maintenance expenses so far", "total spend this month", "how much money spent on maintenance"],
     "cost_by_asset": ["cost by asset", "spend per machine", "which machine costs the most", "top spenders",
-                      "most expensive assets", "maintenance cost per machine", "chart cost by asset"],
+                      "most expensive assets", "maintenance cost per machine", "chart cost by asset", "top machines by spending",
+                      "biggest spenders", "highest cost machines", "machine expenses", "which machines spend the most", "top ten machine spends"],
     "cost_trend": ["monthly cost trend", "cost over time", "spending trend", "cost per month",
                    "how did cost change", "trend of maintenance spend"],
     "forecast": ["forecast next month cost", "predict maintenance spend", "cost prediction",
@@ -1984,6 +2125,8 @@ INTENT_EXAMPLES = {
                        "spare parts cost of machine", "how much spare parts did this machine use"],
     "spend_category": ["spare parts spend by category", "what type of parts cost the most", "opex by item group",
                        "which part category is most expensive", "spend by part type"],
+    "spend_insights": ["any anomalies in the spending", "spending insights", "are there duplicate issues", "key findings spare parts",
+                       "opex findings", "red flags in spare parts spend", "show duplicate lines", "which items have price differences"],
     "app_howto": ["how do i create a work order", "how to add a spare part", "how to report a breakdown",
                   "how to save my data", "how do i upload assets", "how to generate qr code",
                   "how to resume my work", "how to create a pm plan", "how to close a job", "how to export pdf"],
@@ -2051,6 +2194,8 @@ FOLLOW.update({
     "spend_summary": ["Top machines by spare parts spend", "Spare parts spend by category", "Give me an executive summary"],
     "spend_machines": ["Spare parts spend by category", "Which machines are at highest risk?", "Spare parts spending summary"],
     "spend_category": ["Top machines by spare parts spend", "Spare parts spending summary"],
+    "spend_trend": ["Top machines by spare parts spend", "Spare parts spend by category"],
+    "spend_insights": ["Top machines by spare parts spend", "Spare parts spending summary"],
 })
 DEFAULT_FOLLOW = ["Give me an executive summary", "Show open work orders", "List low stock items"]
 
@@ -2060,6 +2205,7 @@ RULES = [
     (r"\b(thanks|thank you|thx)\b", "thanks"),
     (r"\bhow (do|can|to|should|could)\b.*\b(create|add|close|report|upload|import|save|resume|generate|download|change|set|export|view|find|review|print)\b", "app_howto"),
     (r"\bhow to\b", "app_howto"),
+    (r"(anomal|duplicat|double post|red flag|outlier|findings?|insights?)\b.*(opex|spend|spare|parts?|issue)|(opex|spend\w*|spare ?parts?).*(anomal|duplicat|double post|red flag|outlier|findings?|insights?)|\bduplicate (issue|line|posting)s?\b", "spend_insights"),
     (r"(opex|spare ?parts?|parts?)\b.*\b(categor|by type|by group|kind of)|\b(categor\w*|item group)\b.*\b(opex|spare ?parts?|spend)", "spend_category"),
     (r"\bopex\b.*\b(machine|asset|equipment)|\b(machines?|assets?|equipment)\b.*\b(opex|spare ?parts? (spend|cost|consum))|spare ?parts? (spend|cost|consum)\w* (of|for|on) ", "spend_machines"),
     (r"\bopex\b|spare ?parts? (spend|spending|cost|costs|expense|expenses|consumption|consumed)|spend(ing)? on spare", "spend_summary"),
@@ -2177,9 +2323,14 @@ def extract_time_range(ql):
     return None
 
 
+NUM_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+             "eleven": 11, "twelve": 12, "fifteen": 15, "twenty": 20, "thirty": 30, "fifty": 50}
+
 def extract_topn(ql, default):
-    m = re.search(r"(?:top|first|worst|best|biggest|highest|bottom)\s+(\d+)", ql)
-    return (int(m.group(1)), True) if m else (default, False)
+    m = re.search(r"(?:top|first|worst|best|biggest|big|highest|largest|bottom)\s+(\d+|" + "|".join(NUM_WORDS) + r")\b", ql)
+    if not m: return default, False
+    v = m.group(1)
+    return (int(v) if v.isdigit() else NUM_WORDS[v]), True
 
 
 def build_candidates(assets, wo, opex=None):
@@ -2665,6 +2816,32 @@ def h_spend_machines(ctx):
     return R(f"Top **{len(mt)}** machines by spare-parts spend{scope_label(ctx)}: **{mt.iloc[0]['Machine']}** leads with **{fmt_cur(mt.iloc[0]['Spend'])}** ({mt.iloc[0]['Share %']:.1f}%).",
              tbl, chart_spec("barh", mt["Machine"] + " " + mt["Tag"].str[-7:], mt["Spend"], "Top machines by spare-parts spend") if charts_ok(ctx) else None)
 
+def h_spend_insights(ctx):
+    d = _opex_scope(ctx)
+    if ctx.get("opex") is None or ctx["opex"].empty: return R(_NO_OPEX)
+    if d.empty: return R("No spare-parts spend found" + scope_label(ctx) + ".")
+    fnd = opex_findings(d); ql = ctx["ql"]
+    kw = [(r"duplicat|double", "duplicates"), (r"zero|negative|valuation", "zero"), (r"price|unit cost", "price"), (r"big|large|expensive", "bigticket"),
+          (r"repeat|chronic", "repeat"), (r"untag|no tag", "untagged"), (r"master", "master"), (r"outlier", "outliers")]
+    pick = next((k for rx, k in kw if re.search(rx, ql)), None)
+    if pick:
+        x = next((y for y in fnd if y["key"] == pick), None)
+        if x is None: return R(f"No **{pick}** issues were found in the loaded spend data. ✅")
+        return R(f"{SEV_ICON[x['severity']]} **{x['title']}**\n\n{x['summary']}\n\n**What it means:** {x['why']}\n\n**Recommended action:** {x['action']}", x["table"])
+    lines = [f"- {SEV_ICON[x['severity']]} **{x['title']}** - {x['summary']}" for x in fnd if x["severity"] != "info"][:6]
+    return R("### Spending findings\n" + "\n".join(lines) + "\n\n*Ask e.g. \"show duplicate lines\" or \"big ticket issues\" for the exact lines, or open the Insights tab.*")
+
+def h_spend_trend(ctx):
+    d = _opex_scope(ctx)
+    if ctx.get("opex") is None or ctx["opex"].empty: return R(_NO_OPEX)
+    if d.empty: return R("No spare-parts spend found" + scope_label(ctx) + ".")
+    g = d.groupby("period")["value"].sum().sort_index()
+    if len(g) < 2:
+        return R(f"Only one month is loaded (**{g.index[0]}**: {fmt_cur(g.iloc[0])}). Upload more monthly reports in **💰 OPEX & Spend Analysis** to see the trend.")
+    tbl = g.reset_index(); tbl.columns = ["Period", f"Spend ({cur_label()})"]; tbl["MoM %"] = (g.pct_change().values * 100).round(1)
+    return R(f"Monthly spare-parts spend{scope_label(ctx)}: highest in **{g.idxmax()}** ({fmt_cur(g.max())}), lowest in **{g.idxmin()}** ({fmt_cur(g.min())}).",
+             tbl, chart_spec("bar", g.index, g.values, "Monthly spare-parts spend") if charts_ok(ctx) else None)
+
 def h_spend_category(ctx):
     d = _opex_scope(ctx)
     if ctx.get("opex") is None or ctx["opex"].empty: return R(_NO_OPEX)
@@ -2676,7 +2853,7 @@ def h_spend_category(ctx):
 
 
 HANDLERS = {
-    "spend_summary": h_spend_summary, "spend_machines": h_spend_machines, "spend_category": h_spend_category,
+    "spend_summary": h_spend_summary, "spend_machines": h_spend_machines, "spend_category": h_spend_category, "spend_trend": h_spend_trend, "spend_insights": h_spend_insights,
     "greeting": h_greeting, "thanks": h_thanks, "help": h_help, "total_spend": h_total_spend, "cost_by_asset": h_cost_by_asset,
     "cost_trend": h_cost_trend, "forecast": h_forecast, "open_orders": h_open_orders, "closed_orders": h_closed_orders,
     "wo_summary": h_wo_summary, "breakdown_summary": h_breakdown_summary, "bad_actors": h_bad_actors, "mttr": h_mttr,
@@ -2744,12 +2921,19 @@ def migo_process(q, prev, data, history, model):
     ranking = intent_m.rank(ql)
     if intent is None and ranking and ranking[0][1] >= INTENT_THRESHOLD:
         intent, conf = ranking[0]
+    # spending vocabulary always routes to a spending intent (unless a specific KPI/topic rule already matched)
+    SPEND_RX = r"\b(spend\w*|spent|expens\w*|costs?|costing|opex|biggest spenders?)\b"
+    SPEND_OK = {"total_spend", "cost_by_asset", "cost_trend", "forecast", "spend_summary", "spend_machines", "spend_category", "spend_trend",
+                "summary", "performance_report", "inventory_value", "app_howto", "mttr", "mtbf", "availability", "risk"}
+    if engine != "Rule" and re.search(SPEND_RX, ql) and intent not in SPEND_OK:
+        intent, conf, engine = ("cost_by_asset" if re.search(r"machine|asset|equipment|top|big|biggest|highest|most|largest|rank|spenders?", ql) else "total_spend"), 0.5, "Rule"
     # context memory for follow-ups ("and last month?", "what about Oven?")
     reused = False
     carry_ok = prev.get("intent") not in (None, "greeting", "thanks", "help", "unknown", "app_howto", "llm_freeform", "error")
     has_entity = bool(found or time_r or group or want_chart or topn_explicit)
     short = len(ql.split()) <= 6
-    if carry_ok and has_entity and short and engine != "Rule" and conf < 0.6:
+    has_topic = bool(re.search(r"cost|spend|expens|opex|parts?|orders?|breakdown|stock|\bpm\b|technician|risk|mttr|mtbf|availab|summary|report|forecast|trend|categor|asset|machines?\b", ql))
+    if carry_ok and has_entity and short and engine != "Rule" and conf < (0.35 if has_topic else 0.6):
         intent, conf, engine, reused = prev["intent"], 0.5, "Context", True
     if intent is None and found:
         intent, conf = "asset_info", 0.5
@@ -2776,7 +2960,18 @@ def migo_process(q, prev, data, history, model):
         resp = R(txt); resp["follow"] = sugg or DEFAULT_FOLLOW
         return resp, "unknown", 0.0, {"intent": prev.get("intent"), "assets": prev.get("assets", [])}, "NLP"
 
+    # Spending questions without work-order words are answered from the OPEX (actual spare-parts spend) when it is loaded
+    remapped = False
+    ox = data.get("opex")
+    if ox is not None and not ox.empty and intent in ("total_spend", "cost_by_asset", "cost_trend") and not re.search(r"\b(work ?orders?|wo|breakdowns?|pm|preventive)\b", ql):
+        if intent == "cost_trend": intent = "spend_trend"
+        elif intent == "cost_by_asset" or re.search(r"machine|asset|equipment|top|big|biggest|highest|most|largest|rank", ql): intent = "spend_machines"
+        else: intent = "spend_summary"
+        remapped, engine = True, "NLP+OPEX"
     resp = HANDLERS[intent](ctx)
+    if remapped:
+        wo_cost = float(data["wo"]["total_cost"].sum()) if not data["wo"].empty else 0.0
+        if wo_cost > 0 and resp.get("text"): resp["text"] += f"\n\n*(Costs recorded on CMMS work orders: {fmt_cur(wo_cost)} - ask \"work order cost\" for that view.)*"
     resp["follow"] = FOLLOW.get(intent, DEFAULT_FOLLOW)
     return resp, intent, conf, {"intent": intent, "assets": found}, engine
 
@@ -3563,17 +3758,22 @@ elif menu == "💰 OPEX & Spend Analysis":
                 st.dataframe(one_based(hit.sort_values("value", ascending=False)[["gl_date", "machine_label", "item_code", "description", "issue_qty", "value"]].head(200)), use_container_width=True)
 
         # ---------------- insights ----------------
-        ins, anomalies = opex_insights(f)
+        fnd = opex_findings(f)
         with t_in:
-            st.subheader("🧠 Key findings")
-            for i in ins: st.markdown(f"- {i}")
-            for title, tdf in anomalies.items():
-                with st.expander(f"{title} ({len(tdf)})"):
-                    st.dataframe(one_based(tdf.head(200)), use_container_width=True)
-            un = f[~f["tagged"]].groupby(["plant", "line", "machine"])["value"].sum().sort_values(ascending=False).reset_index()
-            if not un.empty:
-                with st.expander(f"Spend without a machine tag ({fmt_cur(un['value'].sum())})"):
-                    st.dataframe(one_based(un.rename(columns={"value": "Spend", "machine": "Cost centre"})), use_container_width=True)
+            st.subheader("🧠 Findings & clarifications")
+            st.caption("Every finding names the machines / items / dates involved, explains what it means and what to do. The detail table lists the exact lines (with the row number in your original report when the file was imported with this version).")
+            cnt = {k: sum(1 for x in fnd if x["severity"] == k) for k in SEV_ORDER}
+            sc = st.columns(4)
+            sc[0].metric("🔴 High", cnt["high"]); sc[1].metric("🟠 Medium", cnt["medium"]); sc[2].metric("🟡 Low", cnt["low"]); sc[3].metric("ℹ️ Information", cnt["info"])
+            for x in fnd:
+                with st.container(border=True):
+                    st.markdown(f"#### {SEV_ICON[x['severity']]} {x['title']}")
+                    st.markdown(x["summary"])
+                    st.markdown(f"**What it means:** {x['why']}")
+                    st.markdown(f"**Recommended action:** {x['action']}")
+                    if x["table"] is not None:
+                        with st.expander(f"📋 Show the {len(x['table'])} line(s)", expanded=len(x["table"]) <= 6):
+                            st.dataframe(one_based(x["table"]), use_container_width=True)
 
         # ---------------- CMMS link ----------------
         cmms = cmms_link_table(f)
@@ -3599,14 +3799,14 @@ elif menu == "💰 OPEX & Spend Analysis":
         # ---------------- export ----------------
         with t_ex:
             st.subheader("Export analysis")
-            st.caption("The Excel workbook contains: insights, by line, machine, part category, item group, top items, month, OPEX vs CMMS, anomaly lists and machines not in the Asset Master.")
+            st.caption("The Excel workbook contains the findings (with explanations and recommended actions) plus one sheet per finding with the exact lines, and the by-line / machine / category / item / month / OPEX-vs-CMMS tables. The PDF has the key findings, a detail section for each finding and the summary tables.")
             e1, e2 = st.columns(2)
             if e1.button("📊 Build Excel workbook", key="ox_xl_build"):
-                st.session_state.ox_xlsx = opex_excel(f, ins, anomalies, cmms)
+                st.session_state.ox_xlsx = opex_excel(f, fnd, cmms)
             if st.session_state.get("ox_xlsx"):
                 e1.download_button("⬇️ Download Excel", st.session_state.ox_xlsx, f"OPEX_Analysis_{datetime.now():%Y%m%d}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="ox_xl_dl")
             if e2.button("📄 Build PDF summary", key="ox_pdf_build"):
-                st.session_state.ox_pdf = opex_pdf(f, ins)
+                st.session_state.ox_pdf = opex_pdf(f, fnd)
             if st.session_state.get("ox_pdf"):
                 e2.download_button("⬇️ Download PDF", st.session_state.ox_pdf, f"OPEX_Summary_{datetime.now():%Y%m%d}.pdf", "application/pdf", key="ox_pdf_dl")
 
